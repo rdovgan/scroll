@@ -3,11 +3,13 @@ package orm
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/scroll-tech/go-ethereum/common"
 	gethTypes "github.com/scroll-tech/go-ethereum/core/types"
+	"github.com/scroll-tech/go-ethereum/log"
 	"gorm.io/gorm"
 
 	"scroll-tech/common/types"
@@ -150,8 +152,33 @@ func (o *PendingTransaction) InsertPendingTransaction(ctx context.Context, conte
 	return nil
 }
 
-// UpdatePendingTransactionStatusByTxHash updates the status of a transaction based on the transaction hash.
-func (o *PendingTransaction) UpdatePendingTransactionStatusByTxHash(ctx context.Context, hash common.Hash, status types.TxStatus, dbTX ...*gorm.DB) error {
+// DeleteTransactionByTxHash permanently deletes a transaction record from the database by transaction hash.
+// Using permanent delete (Unscoped) instead of soft delete to prevent database bloat, as repeated SendTransaction failures
+// could write a large number of transactions to the database.
+func (o *PendingTransaction) DeleteTransactionByTxHash(ctx context.Context, hash common.Hash, dbTX ...*gorm.DB) error {
+	db := o.db
+	if len(dbTX) > 0 && dbTX[0] != nil {
+		db = dbTX[0]
+	}
+	db = db.WithContext(ctx)
+	db = db.Model(&PendingTransaction{})
+
+	// Perform permanent delete by using Unscoped()
+	result := db.Where("hash = ?", hash.String()).Unscoped().Delete(&PendingTransaction{})
+	if result.Error != nil {
+		return fmt.Errorf("failed to delete transaction, err: %w", result.Error)
+	}
+	if result.RowsAffected == 0 {
+		return fmt.Errorf("no transaction found with hash: %s", hash.String())
+	}
+	if result.RowsAffected > 0 {
+		log.Warn("Successfully deleted transaction", "hash", hash.String())
+	}
+	return nil
+}
+
+// UpdateTransactionStatusByTxHash updates the status of a transaction based on the transaction hash.
+func (o *PendingTransaction) UpdateTransactionStatusByTxHash(ctx context.Context, hash common.Hash, status types.TxStatus, dbTX ...*gorm.DB) error {
 	db := o.db
 	if len(dbTX) > 0 && dbTX[0] != nil {
 		db = dbTX[0]
@@ -160,8 +187,27 @@ func (o *PendingTransaction) UpdatePendingTransactionStatusByTxHash(ctx context.
 	db = db.Model(&PendingTransaction{})
 	db = db.Where("hash = ?", hash.String())
 	if err := db.Update("status", status).Error; err != nil {
-		return fmt.Errorf("failed to UpdatePendingTransactionStatusByTxHash, txHash: %s, error: %w", hash, err)
+		return fmt.Errorf("failed to UpdateTransactionStatusByTxHash, txHash: %s, error: %w", hash, err)
 	}
+	return nil
+}
+
+// UpdateTransactionStatusByTxHashes updates the status of multiple transactions by their hashes in one SQL statement
+func (o *PendingTransaction) UpdateTransactionStatusByTxHashes(ctx context.Context, txHashes []string, status types.TxStatus, dbTX ...*gorm.DB) error {
+	if len(txHashes) == 0 {
+		return nil
+	}
+	db := o.db
+	if len(dbTX) > 0 && dbTX[0] != nil {
+		db = dbTX[0]
+	}
+	db = db.WithContext(ctx)
+	db = db.Model(&PendingTransaction{})
+	db = db.Where("hash IN ?", txHashes)
+	if err := db.Update("status", status).Error; err != nil {
+		return fmt.Errorf("failed to update transaction status for hashes %v to status %d: %w", txHashes, status, err)
+	}
+
 	return nil
 }
 
@@ -180,4 +226,28 @@ func (o *PendingTransaction) UpdateOtherTransactionsAsFailedByNonce(ctx context.
 		return fmt.Errorf("failed to update other transactions as failed by nonce, senderAddress: %s, nonce: %d, txHash: %s, error: %w", senderAddress, nonce, hash, err)
 	}
 	return nil
+}
+
+// GetMaxNonceBySenderAddress retrieves the maximum nonce for a specific sender address.
+// Returns -1 if no transactions are found for the given address.
+func (o *PendingTransaction) GetMaxNonceBySenderAddress(ctx context.Context, senderAddress string) (int64, error) {
+	var result struct {
+		Nonce int64 `gorm:"column:nonce"`
+	}
+
+	err := o.db.WithContext(ctx).
+		Model(&PendingTransaction{}).
+		Select("nonce").
+		Where("sender_address = ?", senderAddress).
+		Order("nonce DESC").
+		First(&result).Error
+
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return -1, nil
+		}
+		return -1, fmt.Errorf("failed to get max nonce by sender address, address: %s, err: %w", senderAddress, err)
+	}
+
+	return result.Nonce, nil
 }

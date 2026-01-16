@@ -8,12 +8,14 @@ import (
 	"github.com/scroll-tech/da-codec/encoding"
 	"github.com/scroll-tech/go-ethereum/ethclient"
 	"github.com/scroll-tech/go-ethereum/log"
+	"github.com/scroll-tech/go-ethereum/rpc"
 	"github.com/stretchr/testify/assert"
 	"gorm.io/gorm"
 
+	"scroll-tech/database/migrate"
+
 	"scroll-tech/common/database"
 	"scroll-tech/common/testcontainers"
-	"scroll-tech/database/migrate"
 
 	"scroll-tech/rollup/internal/config"
 )
@@ -26,6 +28,7 @@ var (
 
 	// l2geth client
 	l2Cli *ethclient.Client
+	l2Rpc *rpc.Client
 
 	// block trace
 	block1 *encoding.Block
@@ -61,8 +64,9 @@ func setupEnv(t *testing.T) (err error) {
 	}
 
 	// Create l2geth client.
-	l2Cli, err = testApps.GetL2GethClient()
+	l2Rpc, err = testApps.GetL2Client()
 	assert.NoError(t, err)
+	l2Cli = ethclient.NewClient(l2Rpc)
 
 	block1 = readBlockFromJSON(t, "../../../testdata/blockTrace_02.json")
 	block2 = readBlockFromJSON(t, "../../../testdata/blockTrace_03.json")
@@ -100,29 +104,17 @@ func TestFunction(t *testing.T) {
 	t.Run("TestFetchRunningMissingBlocks", testFetchRunningMissingBlocks)
 
 	// Run chunk proposer test cases.
-	t.Run("TestChunkProposerCodecv0Limits", testChunkProposerCodecv0Limits)
-	t.Run("TestChunkProposerCodecv1Limits", testChunkProposerCodecv1Limits)
-	t.Run("TestChunkProposerCodecv2Limits", testChunkProposerCodecv2Limits)
-	t.Run("TestChunkProposerCodecv3Limits", testChunkProposerCodecv3Limits)
-	t.Run("TestChunkProposerBlobSizeLimit", testChunkProposerBlobSizeLimit)
-	t.Run("TestChunkProposerRespectHardforks", testChunkProposerRespectHardforks)
+	t.Run("TestChunkProposerLimitsCodecV7", testChunkProposerLimitsCodecV7)
+	t.Run("TestChunkProposerUncompressedBatchBytesLimitCodecV8", testChunkProposerUncompressedBatchBytesLimitCodecV8)
 
 	// Run batch proposer test cases.
-	t.Run("TestBatchProposerCodecv0Limits", testBatchProposerCodecv0Limits)
-	t.Run("TestBatchProposerCodecv1Limits", testBatchProposerCodecv1Limits)
-	t.Run("TestBatchProposerCodecv2Limits", testBatchProposerCodecv2Limits)
-	t.Run("TestBatchProposerCodecv3Limits", testBatchProposerCodecv3Limits)
-	t.Run("TestBatchCommitGasAndCalldataSizeCodecv0Estimation", testBatchCommitGasAndCalldataSizeCodecv0Estimation)
-	t.Run("TestBatchCommitGasAndCalldataSizeCodecv1Estimation", testBatchCommitGasAndCalldataSizeCodecv1Estimation)
-	t.Run("TestBatchCommitGasAndCalldataSizeCodecv2Estimation", testBatchCommitGasAndCalldataSizeCodecv2Estimation)
-	t.Run("TestBatchCommitGasAndCalldataSizeCodecv3Estimation", testBatchCommitGasAndCalldataSizeCodecv3Estimation)
-	t.Run("TestBatchProposerBlobSizeLimit", testBatchProposerBlobSizeLimit)
-	t.Run("TestBatchProposerMaxChunkNumPerBatchLimit", testBatchProposerMaxChunkNumPerBatchLimit)
-	t.Run("TestBatchProposerRespectHardforks", testBatchProposerRespectHardforks)
+	t.Run("TestBatchProposerLimitsCodecV7", testBatchProposerLimitsCodecV7)
+	t.Run("TestBatchProposerBlobSizeLimitCodecV7", testBatchProposerBlobSizeLimitCodecV7)
+	t.Run("TestBatchProposerMaxChunkNumPerBatchLimitCodecV7", testBatchProposerMaxChunkNumPerBatchLimitCodecV7)
+	t.Run("TestBatchProposerUncompressedBatchBytesLimitCodecV8", testBatchProposerUncompressedBatchBytesLimitCodecV8)
 
 	// Run bundle proposer test cases.
-	t.Run("TestBundleProposerLimits", testBundleProposerLimits)
-	t.Run("TestBundleProposerRespectHardforks", testBundleProposerRespectHardforks)
+	t.Run("TestBundleProposerLimitsCodecV7", testBundleProposerLimitsCodecV7)
 }
 
 func readBlockFromJSON(t *testing.T, filename string) *encoding.Block {

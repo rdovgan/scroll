@@ -2,227 +2,219 @@
 
 package verifier
 
-/*
-#cgo LDFLAGS: -lzkp -lm -ldl -L${SRCDIR}/lib/ -Wl,-rpath=${SRCDIR}/lib
-#cgo gpu LDFLAGS: -lzkp -lm -ldl -lgmp -lstdc++ -lprocps -L/usr/local/cuda/lib64/ -lcudart -L${SRCDIR}/lib/ -Wl,-rpath=${SRCDIR}/lib
-#include <stdlib.h>
-#include "./lib/libzkp.h"
-*/
-import "C" //nolint:typecheck
-
 import (
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path"
-	"unsafe"
+	"path/filepath"
+	"strings"
 
 	"github.com/scroll-tech/go-ethereum/log"
 
 	"scroll-tech/common/types/message"
 
 	"scroll-tech/coordinator/internal/config"
+	"scroll-tech/coordinator/internal/logic/libzkp"
+	"scroll-tech/coordinator/internal/utils"
 )
 
-// This struct maps to `CircuitConfig` in common/libzkp/impl/src/verifier.rs
+// This struct maps to `CircuitConfig` in libzkp/src/verifier.rs
 // Define a brand new struct here is to eliminate side effects in case fields
 // in `*config.CircuitConfig` being changed
 type rustCircuitConfig struct {
+	Version    uint   `json:"version"`
 	ForkName   string `json:"fork_name"`
-	ParamsPath string `json:"params_path"`
 	AssetsPath string `json:"assets_path"`
+	Features   string `json:"features,omitempty"`
 }
 
-func newRustCircuitConfig(cfg *config.CircuitConfig) *rustCircuitConfig {
+var validiumMode bool
+
+func newRustCircuitConfig(cfg config.AssetConfig) *rustCircuitConfig {
+	ver := cfg.Version
+	if ver == 0 {
+		var err error
+		ver, err = utils.Version(cfg.ForkName, validiumMode)
+		if err != nil {
+			panic(err)
+		}
+	}
+
 	return &rustCircuitConfig{
-		ForkName:   cfg.ForkName,
-		ParamsPath: cfg.ParamsPath,
+		Version:    uint(ver),
 		AssetsPath: cfg.AssetsPath,
+		ForkName:   cfg.ForkName,
+		Features:   cfg.Features,
 	}
 }
 
-// This struct maps to `VerifierConfig` in common/libzkp/impl/src/verifier.rs
+// This struct maps to `VerifierConfig` in coordinator/internal/logic/libzkp/src/verifier.rs
 // Define a brand new struct here is to eliminate side effects in case fields
 // in `*config.VerifierConfig` being changed
 type rustVerifierConfig struct {
-	LowVersionCircuit  *rustCircuitConfig `json:"low_version_circuit"`
-	HighVersionCircuit *rustCircuitConfig `json:"high_version_circuit"`
+	Circuits []*rustCircuitConfig `json:"circuits"`
 }
 
 func newRustVerifierConfig(cfg *config.VerifierConfig) *rustVerifierConfig {
-	return &rustVerifierConfig{
-		LowVersionCircuit:  newRustCircuitConfig(cfg.LowVersionCircuit),
-		HighVersionCircuit: newRustCircuitConfig(cfg.HighVersionCircuit),
+
+	out := &rustVerifierConfig{}
+
+	for _, cfg := range cfg.Verifiers {
+		out.Circuits = append(out.Circuits, newRustCircuitConfig(cfg))
 	}
+	return out
+}
+
+type rustVkDump struct {
+	Chunk  string `json:"chunk_vk"`
+	Batch  string `json:"batch_vk"`
+	Bundle string `json:"bundle_vk"`
 }
 
 // NewVerifier Sets up a rust ffi to call verify.
-func NewVerifier(cfg *config.VerifierConfig) (*Verifier, error) {
-	if cfg.MockMode {
-		chunkVKMap := map[string]struct{}{"mock_vk": {}}
-		batchVKMap := map[string]struct{}{"mock_vk": {}}
-		bundleVKMap := map[string]struct{}{"mock_vk": {}}
-		return &Verifier{cfg: cfg, ChunkVKMap: chunkVKMap, BatchVKMap: batchVKMap, BundleVkMap: bundleVKMap}, nil
-	}
+func NewVerifier(cfg *config.VerifierConfig, useValidiumMode bool) (*Verifier, error) {
+	validiumMode = useValidiumMode
 	verifierConfig := newRustVerifierConfig(cfg)
 	configBytes, err := json.Marshal(verifierConfig)
 	if err != nil {
 		return nil, err
 	}
 
-	configStr := C.CString(string(configBytes))
-	defer func() {
-		C.free(unsafe.Pointer(configStr))
-	}()
-
-	C.init(configStr)
+	libzkp.InitVerifier(string(configBytes))
 
 	v := &Verifier{
 		cfg:         cfg,
-		ChunkVKMap:  make(map[string]struct{}),
-		BatchVKMap:  make(map[string]struct{}),
-		BundleVkMap: make(map[string]struct{}),
+		OpenVMVkMap: make(map[string]struct{}),
+		ChunkVk:     make(map[string][]byte),
+		BatchVk:     make(map[string][]byte),
+		BundleVk:    make(map[string][]byte),
 	}
 
-	bundleVK, err := v.readVK(path.Join(cfg.HighVersionCircuit.AssetsPath, "vk_bundle.vkey"))
-	if err != nil {
-		return nil, err
-	}
-	batchVK, err := v.readVK(path.Join(cfg.HighVersionCircuit.AssetsPath, "vk_batch.vkey"))
-	if err != nil {
-		return nil, err
-	}
-	chunkVK, err := v.readVK(path.Join(cfg.HighVersionCircuit.AssetsPath, "vk_chunk.vkey"))
-	if err != nil {
-		return nil, err
-	}
-	v.BundleVkMap[bundleVK] = struct{}{}
-	v.BatchVKMap[batchVK] = struct{}{}
-	v.ChunkVKMap[chunkVK] = struct{}{}
-
-	if err := v.loadLowVersionVKs(cfg); err != nil {
-		return nil, err
+	for _, cfg := range cfg.Verifiers {
+		if err := v.loadOpenVMVks(cfg); err != nil {
+			return nil, err
+		}
 	}
 
-	v.loadCurieVersionVKs()
 	return v, nil
 }
 
-// VerifyBatchProof Verify a ZkProof by marshaling it and sending it to the Halo2 Verifier.
-func (v *Verifier) VerifyBatchProof(proof *message.BatchProof, forkName string) (bool, error) {
-	if v.cfg.MockMode {
-		log.Info("Mock mode, batch verifier disabled")
-		if string(proof.Proof) == InvalidTestProof {
-			return false, nil
-		}
-		return true, nil
-
-	}
+// VerifyBatchProof Verify a ZkProof by marshaling it and sending it to the Verifier.
+func (v *Verifier) VerifyBatchProof(proof *message.OpenVMBatchProof, forkName string) (bool, error) {
 	buf, err := json.Marshal(proof)
 	if err != nil {
 		return false, err
 	}
 
 	log.Info("Start to verify batch proof", "forkName", forkName)
-	proofStr := C.CString(string(buf))
-	forkNameStr := C.CString(forkName)
-	defer func() {
-		C.free(unsafe.Pointer(proofStr))
-		C.free(unsafe.Pointer(forkNameStr))
-	}()
-
-	verified := C.verify_batch_proof(proofStr, forkNameStr)
-	return verified != 0, nil
+	return libzkp.VerifyBatchProof(string(buf), forkName), nil
 }
 
-// VerifyChunkProof Verify a ZkProof by marshaling it and sending it to the Halo2 Verifier.
-func (v *Verifier) VerifyChunkProof(proof *message.ChunkProof, forkName string) (bool, error) {
-	if v.cfg.MockMode {
-		log.Info("Mock mode, verifier disabled")
-		if string(proof.Proof) == InvalidTestProof {
-			return false, nil
-		}
-		return true, nil
-
-	}
+// VerifyChunkProof Verify a ZkProof by marshaling it and sending it to the Verifier.
+func (v *Verifier) VerifyChunkProof(proof *message.OpenVMChunkProof, forkName string) (bool, error) {
 	buf, err := json.Marshal(proof)
 	if err != nil {
 		return false, err
 	}
 
 	log.Info("Start to verify chunk proof", "forkName", forkName)
-	proofStr := C.CString(string(buf))
-	forkNameStr := C.CString(forkName)
-	defer func() {
-		C.free(unsafe.Pointer(proofStr))
-		C.free(unsafe.Pointer(forkNameStr))
-	}()
 
-	verified := C.verify_chunk_proof(proofStr, forkNameStr)
-	return verified != 0, nil
+	return libzkp.VerifyChunkProof(string(buf), forkName), nil
 }
 
 // VerifyBundleProof Verify a ZkProof for a bundle of batches, by marshaling it and verifying it via the EVM verifier.
-func (v *Verifier) VerifyBundleProof(proof *message.BundleProof, forkName string) (bool, error) {
-	if v.cfg.MockMode {
-		log.Info("Mock mode, verifier disabled")
-		if string(proof.Proof) == InvalidTestProof {
-			return false, nil
-		}
-		return true, nil
-
-	}
+func (v *Verifier) VerifyBundleProof(proof *message.OpenVMBundleProof, forkName string) (bool, error) {
 	buf, err := json.Marshal(proof)
 	if err != nil {
 		return false, err
 	}
 
-	proofStr := C.CString(string(buf))
-	forkNameStr := C.CString(forkName)
-	defer func() {
-		C.free(unsafe.Pointer(proofStr))
-		C.free(unsafe.Pointer(forkNameStr))
-	}()
-
 	log.Info("Start to verify bundle proof ...")
-	verified := C.verify_bundle_proof(proofStr, forkNameStr)
-	return verified != 0, nil
+	return libzkp.VerifyBundleProof(string(buf), forkName), nil
 }
 
-func (v *Verifier) readVK(filePat string) (string, error) {
-	f, err := os.Open(filePat)
+/*
+add vk of imcompatilbe circuit app here to avoid we had used them unexpectedly
+25/07/15: 0.5.0rc0 is no longer compatible since a breaking change
+*/
+const blocked_vks = `
+	rSJNNBpsxBdKlstbIIU/aYc7bHau98Qb2yjZMc5PmDhmGOolp5kYRbvF/VcWcO5HN5ujGs6S00W8pZcCoNQRLQ==,
+	2Lo7Cebm6SFtcsYXipkcMxIBmVY7UpoMXik/Msm7t2nyvi9EaNGsSnDnaCurscYEF+IcdjPUtVtY9EcD7IKwWg==,
+	D6YFHwTLZF/U2zpYJPQ3LwJZRm85yA5Vq2iFBqd3Mk4iwOUpS8sbOp3vg2+NDxhhKphgYpuUlykpdsoRhEt+cw==,
+`
+
+// tries to decode s as hex, and if that fails, as base64.
+func decodeVkString(s string) ([]byte, error) {
+	// Try hex decoding first
+	if b, err := hex.DecodeString(s); err == nil {
+		return b, nil
+	}
+	// Fallback to base64 decoding
+	b, err := base64.StdEncoding.DecodeString(s)
 	if err != nil {
-		return "", err
+		return nil, err
+	}
+	if len(b) == 0 {
+		return nil, fmt.Errorf("decode vk string %s fail (empty bytes)", s)
+	}
+	return b, nil
+}
+
+func (v *Verifier) loadOpenVMVks(cfg config.AssetConfig) error {
+
+	vkFileName := cfg.Vkfile
+	if vkFileName == "" {
+		vkFileName = "openVmVk.json"
+	}
+	vkFile := path.Join(cfg.AssetsPath, vkFileName)
+
+	f, err := os.Open(filepath.Clean(vkFile))
+	if err != nil {
+		return err
 	}
 	byt, err := io.ReadAll(f)
 	if err != nil {
-		return "", err
+		return err
 	}
-	return base64.StdEncoding.EncodeToString(byt), nil
-}
 
-// load low version vks, current is darwin
-func (v *Verifier) loadLowVersionVKs(cfg *config.VerifierConfig) error {
-	bundleVK, err := v.readVK(path.Join(cfg.LowVersionCircuit.AssetsPath, "vk_bundle.vkey"))
+	var dump rustVkDump
+	if err := json.Unmarshal(byt, &dump); err != nil {
+		return err
+	}
+	if strings.Contains(blocked_vks, dump.Chunk) {
+		return fmt.Errorf("loaded blocked chunk vk %s", dump.Chunk)
+	}
+	if strings.Contains(blocked_vks, dump.Batch) {
+		return fmt.Errorf("loaded blocked batch vk %s", dump.Batch)
+	}
+	if strings.Contains(blocked_vks, dump.Bundle) {
+		return fmt.Errorf("loaded blocked bundle vk %s", dump.Bundle)
+	}
+
+	v.OpenVMVkMap[dump.Chunk] = struct{}{}
+	v.OpenVMVkMap[dump.Batch] = struct{}{}
+	v.OpenVMVkMap[dump.Bundle] = struct{}{}
+	log.Info("Load vks", "from", cfg.AssetsPath, "chunk", dump.Chunk, "batch", dump.Batch, "bundle", dump.Bundle)
+
+	decodedBytes, err := decodeVkString(dump.Chunk)
 	if err != nil {
 		return err
 	}
-	batchVK, err := v.readVK(path.Join(cfg.LowVersionCircuit.AssetsPath, "vk_batch.vkey"))
+	v.ChunkVk[cfg.ForkName] = decodedBytes
+	decodedBytes, err = decodeVkString(dump.Batch)
 	if err != nil {
 		return err
 	}
-	chunkVK, err := v.readVK(path.Join(cfg.LowVersionCircuit.AssetsPath, "vk_chunk.vkey"))
+	v.BatchVk[cfg.ForkName] = decodedBytes
+	decodedBytes, err = decodeVkString(dump.Bundle)
 	if err != nil {
 		return err
 	}
-	v.BundleVkMap[bundleVK] = struct{}{}
-	v.BatchVKMap[batchVK] = struct{}{}
-	v.ChunkVKMap[chunkVK] = struct{}{}
+	v.BundleVk[cfg.ForkName] = decodedBytes
+
 	return nil
-}
-
-func (v *Verifier) loadCurieVersionVKs() {
-	v.BatchVKMap["AAAAGgAAAARX2S0K1wF333B1waOsnG/vcASJmWG9YM6SNWCBy1ywD9jfGkei+f0wNYpkjW7JO12EfU7CjYVBo+PGku3zaQJI64lbn6BwyTBa4RfrPFpV5mP47ix0sXZ+Wt5wklMLRW7OIJb1yfCDm+gkSsp3/Zqrxt4SY4rQ4WtHfynTCQ0KDi78jNuiFvwxO3ub3DkgGVaxMkGxTRP/Vz6E7MCZMUBR5wZFcMzJn+73f0wYjDxfj00krg9O1VrwVxbVV1ycLR6oQLcOgm/l+xwth8io0vDpF9OY21gD5DgJn9GgcYe8KoRVEbEqApLZPdBibpcSMTY9czZI2LnFcqrDDmYvhEwgjhZrsTog2xLXOODoOupZ/is5ekQ9Gi0y871b1mLlCGA="] = struct{}{}
-	v.ChunkVKMap["AAAAGQAAAATyWEABRbJ6hQQ5/zLX1gTasr7349minA9rSgMS6gDeHwZKqikRiO3md+pXjjxMHnKQtmXYgMXhJSvlmZ+Ws+cheuly2X1RuNQzcZuRImaKPR9LJsVZYsXfJbuqdKX8p0Gj8G83wMJOmTzNVUyUol0w0lTU+CEiTpHOnxBsTF3EWaW3s1u4ycOgWt1c9M6s7WmaBZLYgAWYCunO5CLCLApNGbCASeck/LuSoedEri5u6HccCKU2khG6zl6W07jvYSbDVLJktbjRiHv+/HQix+K14j8boo8Z/unhpwXCsPxkQA=="] = struct{}{}
 }

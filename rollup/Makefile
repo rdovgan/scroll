@@ -11,12 +11,16 @@ mock_abi:
 rollup_bins: ## Builds the Rollup bins.
 	go build -o $(PWD)/build/bin/gas_oracle ./cmd/gas_oracle/
 	go build -o $(PWD)/build/bin/rollup_relayer ./cmd/rollup_relayer/
+	go build -o $(PWD)/build/bin/blob_uploader ./cmd/blob_uploader/
 
 gas_oracle: ## Builds the gas_oracle bin
 	go build -o $(PWD)/build/bin/gas_oracle ./cmd/gas_oracle/
 
 rollup_relayer: ## Builds the rollup_relayer bin
 	go build -o $(PWD)/build/bin/rollup_relayer ./cmd/rollup_relayer/
+
+blob_uploader: ## Builds the blob_uploader bin
+	go build -o $(PWD)/build/bin/blob_uploader ./cmd/blob_uploader/
 
 test:
 	go test -v -race -coverprofile=coverage.txt -covermode=atomic -p 1 $(PWD)/...
@@ -32,5 +36,5 @@ docker_push:
 	docker push scrolltech/rollup-relayer:${IMAGE_VERSION}
 
 docker:
-	DOCKER_BUILDKIT=1 docker build -t scrolltech/gas-oracle:${IMAGE_VERSION} ${REPO_ROOT_DIR}/ -f ${REPO_ROOT_DIR}/build/dockerfiles/gas_oracle.Dockerfile
-	DOCKER_BUILDKIT=1 docker build -t scrolltech/rollup-relayer:${IMAGE_VERSION} ${REPO_ROOT_DIR}/ -f ${REPO_ROOT_DIR}/build/dockerfiles/rollup_relayer.Dockerfile
+	DOCKER_BUILDKIT=1 docker build -t scrolltech/gas-oracle:${IMAGE_VERSION} ${REPO_ROOT_DIR}/ -f ${REPO_ROOT_DIR}/build/dockerfiles/gas_oracle.Dockerfile --platform=linux/amd64
+	DOCKER_BUILDKIT=1 docker build -t scrolltech/rollup-relayer:${IMAGE_VERSION} ${REPO_ROOT_DIR}/ -f ${REPO_ROOT_DIR}/build/dockerfiles/rollup_relayer.Dockerfile --platform=linux/amd64

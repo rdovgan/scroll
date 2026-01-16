@@ -1,5 +1,5 @@
 # Download Go dependencies
-FROM scrolltech/go-rust-builder:go-1.21-rust-nightly-2023-12-03 as base
+FROM scrolltech/go-rust-builder:go-1.22-rust-nightly-2023-12-03 as base
 
 WORKDIR /src
 COPY go.work* ./
@@ -21,7 +21,7 @@ RUN --mount=target=. \
 # Pull gas_oracle into a second stage deploy ubuntu container
 FROM ubuntu:20.04
 
-RUN apt update && apt install ca-certificates -y
+RUN apt update && apt install vim netcat-openbsd net-tools curl ca-certificates -y
 
 ENV CGO_LDFLAGS="-ldl"
 

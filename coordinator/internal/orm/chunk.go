@@ -2,18 +2,15 @@ package orm
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
 
 	"github.com/scroll-tech/da-codec/encoding"
-	"github.com/scroll-tech/da-codec/encoding/codecv0"
 	"github.com/scroll-tech/go-ethereum/log"
 	"gorm.io/gorm"
 
 	"scroll-tech/common/types"
-	"scroll-tech/common/types/message"
 	"scroll-tech/common/utils"
 )
 
@@ -31,6 +28,8 @@ type Chunk struct {
 	StartBlockTime               uint64 `json:"start_block_time" gorm:"column:start_block_time"`
 	TotalL1MessagesPoppedBefore  uint64 `json:"total_l1_messages_popped_before" gorm:"column:total_l1_messages_popped_before"`
 	TotalL1MessagesPoppedInChunk uint64 `json:"total_l1_messages_popped_in_chunk" gorm:"column:total_l1_messages_popped_in_chunk"`
+	PrevL1MessageQueueHash       string `json:"prev_l1_message_queue_hash" gorm:"column:prev_l1_message_queue_hash"`
+	PostL1MessageQueueHash       string `json:"post_l1_message_queue_hash" gorm:"column:post_l1_message_queue_hash"`
 	ParentChunkHash              string `json:"parent_chunk_hash" gorm:"column:parent_chunk_hash"`
 	StateRoot                    string `json:"state_root" gorm:"column:state_root"`
 	ParentChunkStateRoot         string `json:"parent_chunk_state_root" gorm:"column:parent_chunk_state_root"`
@@ -77,7 +76,7 @@ func (*Chunk) TableName() string {
 func (o *Chunk) GetUnassignedChunk(ctx context.Context, maxActiveAttempts, maxTotalAttempts uint8, height uint64) (*Chunk, error) {
 	var chunk Chunk
 	db := o.db.WithContext(ctx)
-	sql := fmt.Sprintf("SELECT * FROM chunk WHERE proving_status = %d AND total_attempts < %d AND active_attempts < %d AND end_block_number <= %d AND chunk.deleted_at IS NULL ORDER BY chunk.index LIMIT 1;",
+	sql := fmt.Sprintf("SELECT * FROM chunk WHERE proving_status = %d AND total_attempts < %d AND active_attempts < %d AND end_block_number <= %d AND codec_version != 5 AND chunk.deleted_at IS NULL ORDER BY chunk.index LIMIT 1;",
 		int(types.ProvingTaskUnassigned), maxTotalAttempts, maxActiveAttempts, height)
 	err := db.Raw(sql).Scan(&chunk).Error
 	if err != nil {
@@ -87,6 +86,23 @@ func (o *Chunk) GetUnassignedChunk(ctx context.Context, maxActiveAttempts, maxTo
 		return nil, nil
 	}
 	return &chunk, nil
+}
+
+// GetUnassignedChunkCount retrieves unassigned chunk count.
+func (o *Chunk) GetUnassignedChunkCount(ctx context.Context, maxActiveAttempts, maxTotalAttempts uint8, height uint64) (int64, error) {
+	var count int64
+	db := o.db.WithContext(ctx)
+	db = db.Model(&Chunk{})
+	db = db.Where("proving_status = ?", int(types.ProvingTaskUnassigned))
+	db = db.Where("total_attempts < ?", maxTotalAttempts)
+	db = db.Where("active_attempts < ?", maxActiveAttempts)
+	db = db.Where("end_block_number <= ?", height)
+	db = db.Where("codec_version != 5")
+	db = db.Where("chunk.deleted_at IS NULL")
+	if err := db.Count(&count).Error; err != nil {
+		return 0, fmt.Errorf("Chunk.GetUnassignedChunkCount error: %w", err)
+	}
+	return count, nil
 }
 
 // GetAssignedChunk retrieves assigned chunk based on the specified limit.
@@ -119,32 +135,6 @@ func (o *Chunk) GetChunksByBatchHash(ctx context.Context, batchHash string) ([]*
 		return nil, fmt.Errorf("Chunk.GetChunksByBatchHash error: %w, batch hash: %v", err, batchHash)
 	}
 	return chunks, nil
-}
-
-// GetProofsByBatchHash retrieves the proofs associated with a specific batch hash.
-// It returns a slice of decoded proofs (message.ChunkProof) obtained from the database.
-// The returned proofs are sorted in ascending order by their associated chunk index.
-func (o *Chunk) GetProofsByBatchHash(ctx context.Context, batchHash string) ([]*message.ChunkProof, error) {
-	db := o.db.WithContext(ctx)
-	db = db.Model(&Chunk{})
-	db = db.Where("batch_hash", batchHash)
-	db = db.Order("index ASC")
-
-	var chunks []*Chunk
-	if err := db.Find(&chunks).Error; err != nil {
-		return nil, fmt.Errorf("Chunk.GetProofsByBatchHash error: %w, batch hash: %v", err, batchHash)
-	}
-
-	var proofs []*message.ChunkProof
-	for _, chunk := range chunks {
-		var proof message.ChunkProof
-		if err := json.Unmarshal(chunk.Proof, &proof); err != nil {
-			return nil, fmt.Errorf("Chunk.GetProofsByBatchHash unmarshal proof error: %w, batch hash: %v, chunk hash: %v", err, batchHash, chunk.Hash)
-		}
-		proofs = append(proofs, &proof)
-	}
-
-	return proofs, nil
 }
 
 // getLatestChunk retrieves the latest chunk from the database.
@@ -258,7 +248,12 @@ func (o *Chunk) InsertChunk(ctx context.Context, chunk *encoding.Chunk, dbTX ...
 		parentChunkStateRoot = parentChunk.StateRoot
 	}
 
-	daChunk, err := codecv0.NewDAChunk(chunk, totalL1MessagePoppedBefore)
+	codec, err := encoding.CodecFromVersion(encoding.CodecV0)
+	if err != nil {
+		return nil, fmt.Errorf("Chunk.InsertChunk error: %w", err)
+	}
+
+	daChunk, err := codec.NewDAChunk(chunk, totalL1MessagePoppedBefore)
 	if err != nil {
 		log.Error("failed to initialize new DA chunk", "err", err)
 		return nil, fmt.Errorf("Chunk.InsertChunk error: %w", err)
@@ -270,13 +265,13 @@ func (o *Chunk) InsertChunk(ctx context.Context, chunk *encoding.Chunk, dbTX ...
 		return nil, fmt.Errorf("Chunk.InsertChunk error: %w", err)
 	}
 
-	totalL1CommitCalldataSize, err := codecv0.EstimateChunkL1CommitCalldataSize(chunk)
+	totalL1CommitCalldataSize, err := codec.EstimateChunkL1CommitCalldataSize(chunk)
 	if err != nil {
 		log.Error("failed to estimate chunk L1 commit calldata size", "err", err)
 		return nil, fmt.Errorf("Chunk.InsertChunk error: %w", err)
 	}
 
-	totalL1CommitGas, err := codecv0.EstimateChunkL1CommitGas(chunk)
+	totalL1CommitGas, err := codec.EstimateChunkL1CommitGas(chunk)
 	if err != nil {
 		log.Error("failed to estimate chunk L1 commit gas", "err", err)
 		return nil, fmt.Errorf("Chunk.InsertChunk error: %w", err)
@@ -290,7 +285,7 @@ func (o *Chunk) InsertChunk(ctx context.Context, chunk *encoding.Chunk, dbTX ...
 		StartBlockHash:               chunk.Blocks[0].Header.Hash().Hex(),
 		EndBlockNumber:               chunk.Blocks[numBlocks-1].Header.Number.Uint64(),
 		EndBlockHash:                 chunk.Blocks[numBlocks-1].Header.Hash().Hex(),
-		TotalL2TxGas:                 chunk.L2GasUsed(),
+		TotalL2TxGas:                 chunk.TotalGasUsed(),
 		TotalL2TxNum:                 chunk.NumL2Transactions(),
 		TotalL1CommitCalldataSize:    totalL1CommitCalldataSize,
 		TotalL1CommitGas:             totalL1CommitGas,

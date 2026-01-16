@@ -9,7 +9,6 @@ import (
 	"testing"
 
 	"github.com/scroll-tech/da-codec/encoding"
-	"github.com/scroll-tech/da-codec/encoding/codecv0"
 	"github.com/scroll-tech/go-ethereum/common"
 	"github.com/scroll-tech/go-ethereum/ethclient"
 	"github.com/scroll-tech/go-ethereum/log"
@@ -57,6 +56,7 @@ func setupEnv(t *testing.T) {
 
 	cfg.L2Config.RelayerConfig.SenderConfig.Endpoint, err = testApps.GetPoSL1EndPoint()
 	assert.NoError(t, err)
+	cfg.L2Config.RelayerConfig.SenderConfig.WriteEndpoints = []string{cfg.L2Config.RelayerConfig.SenderConfig.Endpoint, cfg.L2Config.RelayerConfig.SenderConfig.Endpoint}
 	cfg.L1Config.RelayerConfig.SenderConfig.Endpoint, err = testApps.GetL2GethEndPoint()
 	assert.NoError(t, err)
 
@@ -82,8 +82,11 @@ func setupEnv(t *testing.T) {
 	block1 = &encoding.Block{}
 	err = json.Unmarshal(templateBlockTrace1, block1)
 	assert.NoError(t, err)
+	block1.Header.Number = big.NewInt(1)
 	chunk1 = &encoding.Chunk{Blocks: []*encoding.Block{block1}}
-	daChunk1, err := codecv0.NewDAChunk(chunk1, 0)
+	codec, err := encoding.CodecFromVersion(encoding.CodecV0)
+	assert.NoError(t, err)
+	daChunk1, err := codec.NewDAChunk(chunk1, 0)
 	assert.NoError(t, err)
 	chunkHash1, err = daChunk1.Hash()
 	assert.NoError(t, err)
@@ -93,8 +96,9 @@ func setupEnv(t *testing.T) {
 	block2 = &encoding.Block{}
 	err = json.Unmarshal(templateBlockTrace2, block2)
 	assert.NoError(t, err)
+	block2.Header.Number = big.NewInt(2)
 	chunk2 = &encoding.Chunk{Blocks: []*encoding.Block{block2}}
-	daChunk2, err := codecv0.NewDAChunk(chunk2, chunk1.NumL1Messages(0))
+	daChunk2, err := codec.NewDAChunk(chunk2, chunk1.NumL1Messages(0))
 	assert.NoError(t, err)
 	chunkHash2, err = daChunk2.Hash()
 	assert.NoError(t, err)
@@ -123,15 +127,10 @@ func TestFunctions(t *testing.T) {
 	// Run l2 relayer test cases.
 	t.Run("TestCreateNewRelayer", testCreateNewRelayer)
 	t.Run("TestL2RelayerProcessPendingBatches", testL2RelayerProcessPendingBatches)
-	t.Run("TestL2RelayerProcessCommittedBatches", testL2RelayerProcessCommittedBatches)
 	t.Run("TestL2RelayerProcessPendingBundles", testL2RelayerProcessPendingBundles)
-	t.Run("TestL2RelayerFinalizeTimeoutBatches", testL2RelayerFinalizeTimeoutBatches)
 	t.Run("TestL2RelayerFinalizeTimeoutBundles", testL2RelayerFinalizeTimeoutBundles)
 	t.Run("TestL2RelayerCommitConfirm", testL2RelayerCommitConfirm)
-	t.Run("TestL2RelayerFinalizeBatchConfirm", testL2RelayerFinalizeBatchConfirm)
 	t.Run("TestL2RelayerFinalizeBundleConfirm", testL2RelayerFinalizeBundleConfirm)
-	t.Run("TestL2RelayerGasOracleConfirm", testL2RelayerGasOracleConfirm)
-	t.Run("TestLayer2RelayerProcessGasPriceOracle", testLayer2RelayerProcessGasPriceOracle)
 
 	// test getBatchStatusByIndex
 	t.Run("TestGetBatchStatusByIndex", testGetBatchStatusByIndex)

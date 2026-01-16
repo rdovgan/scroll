@@ -1,10 +1,14 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"reflect"
-	"scroll-tech/common/database"
 	"strings"
+
+	"scroll-tech/common/database"
 
 	"github.com/mitchellh/mapstructure"
 	"github.com/scroll-tech/go-ethereum/common"
@@ -14,9 +18,15 @@ import (
 
 // Config load configuration items.
 type Config struct {
-	L1Config *L1Config        `json:"l1_config"`
-	L2Config *L2Config        `json:"l2_config"`
-	DBConfig *database.Config `json:"db_config"`
+	L1Config       *L1Config        `json:"l1_config"`
+	L2Config       *L2Config        `json:"l2_config"`
+	DBConfig       *database.Config `json:"db_config"`
+	RecoveryConfig *RecoveryConfig  `json:"recovery_config"`
+}
+
+type ConfigForReplay struct {
+	Config
+	DBConfigForReplay *database.Config `json:"db_config_for_replay"`
 }
 
 // NewConfig returns a new instance of Config.
@@ -81,6 +91,22 @@ func NewConfig(file string) (*Config, error) {
 	}
 
 	if err := v.Unmarshal(cfg, viper.DecodeHook(decoderConfig.DecodeHook)); err != nil {
+		return nil, err
+	}
+
+	return cfg, nil
+}
+
+// NewConfigForReplay returns a new instance of ConfigForReplay.
+func NewConfigForReplay(file string) (*ConfigForReplay, error) {
+	buf, err := os.ReadFile(filepath.Clean(file))
+	if err != nil {
+		return nil, err
+	}
+
+	cfg := &ConfigForReplay{}
+	err = json.Unmarshal(buf, cfg)
+	if err != nil {
 		return nil, err
 	}
 

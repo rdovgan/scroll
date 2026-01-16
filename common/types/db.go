@@ -276,8 +276,8 @@ const (
 	SenderTypeFinalizeBatch
 	// SenderTypeL1GasOracle indicates a sender from L2 responsible for updating L1 gas prices.
 	SenderTypeL1GasOracle
-	// SenderTypeL2GasOracle indicates a sender from L1 responsible for updating L2 gas prices.
-	SenderTypeL2GasOracle
+	// SenderTypeL2GasOracleDeprecated indicates a sender from L1 responsible for updating L2 gas prices, which is deprecated.
+	SenderTypeL2GasOracleDeprecated
 )
 
 // String returns a string representation of the SenderType.
@@ -289,8 +289,8 @@ func (t SenderType) String() string {
 		return "SenderTypeFinalizeBatch"
 	case SenderTypeL1GasOracle:
 		return "SenderTypeL1GasOracle"
-	case SenderTypeL2GasOracle:
-		return "SenderTypeL2GasOracle"
+	case SenderTypeL2GasOracleDeprecated:
+		return "SenderTypeL2GasOracleDeprecated"
 	default:
 		return fmt.Sprintf("Unknown SenderType (%d)", int32(t))
 	}
@@ -324,5 +324,55 @@ func (s TxStatus) String() string {
 		return "TxStatusConfirmedFailed"
 	default:
 		return fmt.Sprintf("Unknown TxStatus (%d)", int32(s))
+	}
+}
+
+// BlobUploadStatus represents the status of a blob upload
+type BlobUploadStatus int
+
+const (
+	// BlobUploadStatusUndefined indicates an undefined status
+	BlobUploadStatusUndefined BlobUploadStatus = iota
+	// BlobUploadStatusPending indicates a pending upload status
+	BlobUploadStatusPending
+	// BlobUploadStatusUploaded indicates a successful upload status
+	BlobUploadStatusUploaded
+	// BlobUploadStatusFailed indicates a failed upload status
+	BlobUploadStatusFailed
+)
+
+func (s BlobUploadStatus) String() string {
+	switch s {
+	case BlobUploadStatusPending:
+		return "BlobUploadStatusPending"
+	case BlobUploadStatusUploaded:
+		return "BlobUploadStatusUploaded"
+	case BlobUploadStatusFailed:
+		return "BlobUploadStatusFailed"
+	default:
+		return fmt.Sprintf("Unknown BlobUploadStatus (%d)", int32(s))
+	}
+}
+
+// BlobStoragePlatform represents the platform a blob upload to
+type BlobStoragePlatform int
+
+const (
+	// BlobStoragePlatformUndefined indicates an undefined platform
+	BlobStoragePlatformUndefined BlobStoragePlatform = iota
+	// BlobStoragePlatformS3 represents AWS S3
+	BlobStoragePlatformS3
+	// BlobStoragePlatformArweave represents storage blockchain Arweave
+	BlobStoragePlatformArweave
+)
+
+func (s BlobStoragePlatform) String() string {
+	switch s {
+	case BlobStoragePlatformS3:
+		return "BlobStoragePlatformS3"
+	case BlobStoragePlatformArweave:
+		return "BlobStoragePlatformArweave"
+	default:
+		return fmt.Sprintf("Unknown BlobStoragePlatform (%d)", int32(s))
 	}
 }

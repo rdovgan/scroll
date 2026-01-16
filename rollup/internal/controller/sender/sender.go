@@ -3,18 +3,17 @@ package sender
 import (
 	"bytes"
 	"context"
-	"crypto/ecdsa"
 	"errors"
 	"fmt"
 	"math/big"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/holiman/uint256"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/scroll-tech/go-ethereum/accounts/abi/bind"
 	"github.com/scroll-tech/go-ethereum/common"
-	"github.com/scroll-tech/go-ethereum/consensus/misc"
+	"github.com/scroll-tech/go-ethereum/common/hexutil"
 	gethTypes "github.com/scroll-tech/go-ethereum/core/types"
 	"github.com/scroll-tech/go-ethereum/crypto/kzg4844"
 	"github.com/scroll-tech/go-ethereum/ethclient"
@@ -40,7 +39,7 @@ const (
 )
 
 var (
-	// ErrTooManyPendingBlobTxs
+	// ErrTooManyPendingBlobTxs error for too many pending blob txs
 	ErrTooManyPendingBlobTxs = errors.New("the limit of pending blob-carrying transactions has been exceeded")
 )
 
@@ -65,18 +64,19 @@ type FeeData struct {
 	gasLimit uint64
 }
 
-// Sender Transaction sender to send transaction to l1/l2 geth
+// Sender Transaction sender to send transaction to l1/l2
 type Sender struct {
-	config     *config.SenderConfig
-	gethClient *gethclient.Client
-	client     *ethclient.Client // The client to retrieve on chain data or send transaction.
-	chainID    *big.Int          // The chain id of the endpoint
-	ctx        context.Context
-	service    string
-	name       string
-	senderType types.SenderType
-
-	auth *bind.TransactOpts
+	config            *config.SenderConfig
+	rpcClient         *rpc.Client         // Raw RPC client
+	gethClient        *gethclient.Client  // Client to use for CreateAccessList
+	client            *ethclient.Client   // The client to retrieve on chain data (read-only)
+	writeClients      []*ethclient.Client // The clients to send transactions to (write operations)
+	transactionSigner *TransactionSigner
+	chainID           *big.Int // The chain id of the endpoint
+	ctx               context.Context
+	service           string
+	name              string
+	senderType        types.SenderType
 
 	db                    *gorm.DB
 	pendingTransactionOrm *orm.PendingTransaction
@@ -88,14 +88,15 @@ type Sender struct {
 }
 
 // NewSender returns a new instance of transaction sender
-func NewSender(ctx context.Context, config *config.SenderConfig, priv *ecdsa.PrivateKey, service, name string, senderType types.SenderType, db *gorm.DB, reg prometheus.Registerer) (*Sender, error) {
+func NewSender(ctx context.Context, config *config.SenderConfig, signerConfig *config.SignerConfig, service, name string, senderType types.SenderType, db *gorm.DB, reg prometheus.Registerer) (*Sender, error) {
 	if config.EscalateMultipleNum <= config.EscalateMultipleDen {
 		return nil, fmt.Errorf("invalid params, EscalateMultipleNum; %v, EscalateMultipleDen: %v", config.EscalateMultipleNum, config.EscalateMultipleDen)
 	}
 
+	// Initialize read client
 	rpcClient, err := rpc.Dial(config.Endpoint)
 	if err != nil {
-		return nil, fmt.Errorf("failed to dial eth client, err: %w", err)
+		return nil, fmt.Errorf("failed to dial read client, err: %w", err)
 	}
 
 	client := ethclient.NewClient(rpcClient)
@@ -103,26 +104,50 @@ func NewSender(ctx context.Context, config *config.SenderConfig, priv *ecdsa.Pri
 	if err != nil {
 		return nil, fmt.Errorf("failed to get chain ID, err: %w", err)
 	}
-
-	auth, err := bind.NewKeyedTransactorWithChainID(priv, chainID)
+	transactionSigner, err := NewTransactionSigner(signerConfig, chainID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create transactor with chain ID %v, err: %w", chainID, err)
+		return nil, fmt.Errorf("failed to create transaction signer, err: %w", err)
 	}
 
-	// Set pending nonce
-	nonce, err := client.PendingNonceAt(ctx, auth.From)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get pending nonce for address %s, err: %w", auth.From.Hex(), err)
-	}
-	auth.Nonce = big.NewInt(int64(nonce))
+	// Initialize write clients
+	var writeClients []*ethclient.Client
+	if len(config.WriteEndpoints) > 0 {
+		// Use specified write endpoints
+		for i, endpoint := range config.WriteEndpoints {
+			writeRpcClient, err := rpc.Dial(endpoint)
+			if err != nil {
+				return nil, fmt.Errorf("failed to dial write client %d (endpoint: %s), err: %w", i, endpoint, err)
+			}
+			writeClient := ethclient.NewClient(writeRpcClient)
 
+			// Verify the write client is connected to the same chain
+			writeChainID, err := writeClient.ChainID(ctx)
+			if err != nil {
+				return nil, fmt.Errorf("failed to get chain ID from write client %d (endpoint: %s), err: %w", i, endpoint, err)
+			}
+			if writeChainID.Cmp(chainID) != 0 {
+				return nil, fmt.Errorf("write client %d (endpoint: %s) has different chain ID %s, expected %s", i, endpoint, writeChainID.String(), chainID.String())
+			}
+
+			writeClients = append(writeClients, writeClient)
+		}
+		log.Info("initialized sender with multiple write clients", "service", service, "name", name, "readEndpoint", config.Endpoint, "writeEndpoints", config.WriteEndpoints)
+	} else {
+		// Use read client for writing (backward compatibility)
+		writeClients = append(writeClients, client)
+		log.Info("initialized sender with single client", "service", service, "name", name, "endpoint", config.Endpoint)
+	}
+
+	// Create sender instance first and then initialize nonce
 	sender := &Sender{
 		ctx:                   ctx,
 		config:                config,
+		rpcClient:             rpcClient,
 		gethClient:            gethclient.New(rpcClient),
 		client:                client,
+		writeClients:          writeClients,
 		chainID:               chainID,
-		auth:                  auth,
+		transactionSigner:     transactionSigner,
 		db:                    db,
 		pendingTransactionOrm: orm.NewPendingTransaction(db),
 		confirmCh:             make(chan *Confirmation, 128),
@@ -131,8 +156,13 @@ func NewSender(ctx context.Context, config *config.SenderConfig, priv *ecdsa.Pri
 		service:               service,
 		senderType:            senderType,
 	}
-	sender.metrics = initSenderMetrics(reg)
 
+	// Initialize nonce using the new method
+	if err := sender.resetNonce(); err != nil {
+		return nil, fmt.Errorf("failed to reset nonce: %w", err)
+	}
+
+	sender.metrics = initSenderMetrics(reg)
 	go sender.loop(ctx)
 
 	return sender, nil
@@ -146,7 +176,7 @@ func (s *Sender) GetChainID() *big.Int {
 // Stop stop the sender module.
 func (s *Sender) Stop() {
 	close(s.stopCh)
-	log.Info("sender stopped", "name", s.name, "service", s.service, "address", s.auth.From.String())
+	log.Info("sender stopped", "name", s.name, "service", s.service, "address", s.transactionSigner.GetAddr().String())
 }
 
 // ConfirmChan channel used to communicate with transaction sender
@@ -160,31 +190,112 @@ func (s *Sender) SendConfirmation(cfm *Confirmation) {
 	s.confirmCh <- cfm
 }
 
-func (s *Sender) getFeeData(target *common.Address, data []byte, sidecar *gethTypes.BlobTxSidecar, baseFee, blobBaseFee uint64, fallbackGasLimit uint64) (*FeeData, error) {
+func (s *Sender) getFeeData(target *common.Address, data []byte, sidecar *gethTypes.BlobTxSidecar, baseFee, blobBaseFee uint64) (*FeeData, error) {
 	switch s.config.TxType {
 	case LegacyTxType:
-		return s.estimateLegacyGas(target, data, fallbackGasLimit)
+		return s.estimateLegacyGas(target, data)
 	case DynamicFeeTxType:
 		if sidecar == nil {
-			return s.estimateDynamicGas(target, data, baseFee, fallbackGasLimit)
+			return s.estimateDynamicGas(target, data, baseFee)
 		}
-		return s.estimateBlobGas(target, data, sidecar, baseFee, blobBaseFee, fallbackGasLimit)
+		return s.estimateBlobGas(target, data, sidecar, baseFee, blobBaseFee)
 	default:
 		return nil, fmt.Errorf("unsupported transaction type: %s", s.config.TxType)
 	}
 }
 
+// sendTransactionToMultipleClients sends a transaction to all write clients in parallel
+// and returns success if at least one client succeeds
+func (s *Sender) sendTransactionToMultipleClients(signedTx *gethTypes.Transaction) error {
+	ctx, cancel := context.WithTimeout(s.ctx, 15*time.Second)
+	defer cancel()
+
+	if len(s.writeClients) == 1 {
+		// Single client - use direct approach
+		return s.writeClients[0].SendTransaction(ctx, signedTx)
+	}
+
+	// Multiple clients - send in parallel
+	type result struct {
+		endpoint string
+		err      error
+	}
+
+	resultChan := make(chan result, len(s.writeClients))
+	var wg sync.WaitGroup
+
+	// Send transaction to all write clients in parallel
+	for i, client := range s.writeClients {
+		wg.Add(1)
+		// Determine endpoint URL for this client
+		endpoint := s.config.WriteEndpoints[i]
+
+		go func(ep string, writeClient *ethclient.Client) {
+			defer wg.Done()
+			err := writeClient.SendTransaction(ctx, signedTx)
+			resultChan <- result{endpoint: ep, err: err}
+		}(endpoint, client)
+	}
+
+	// Wait for all goroutines to finish
+	go func() {
+		wg.Wait()
+		close(resultChan)
+	}()
+
+	// Collect results
+	var errs []error
+	for res := range resultChan {
+		if res.err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", res.endpoint, res.err))
+			log.Warn("failed to send transaction to write client",
+				"endpoint", res.endpoint,
+				"txHash", signedTx.Hash().Hex(),
+				"nonce", signedTx.Nonce(),
+				"from", s.transactionSigner.GetAddr().String(),
+				"error", res.err)
+		} else {
+			log.Info("successfully sent transaction to write client",
+				"endpoint", res.endpoint,
+				"txHash", signedTx.Hash().Hex(),
+				"nonce", signedTx.Nonce(),
+				"from", s.transactionSigner.GetAddr().String())
+		}
+	}
+
+	// Check if at least one client succeeded
+	if len(errs) < len(s.writeClients) {
+		successCount := len(s.writeClients) - len(errs)
+		if len(errs) > 0 {
+			log.Info("transaction partially succeeded",
+				"txHash", signedTx.Hash().Hex(),
+				"successCount", successCount,
+				"totalClients", len(s.writeClients),
+				"failures", errors.Join(errs...))
+		}
+		return nil
+	}
+
+	// All clients failed
+	return fmt.Errorf("failed to send transaction to all %d write clients: %w", len(s.writeClients), errors.Join(errs...))
+}
+
 // SendTransaction send a signed L2tL1 transaction.
-func (s *Sender) SendTransaction(contextID string, target *common.Address, data []byte, blob *kzg4844.Blob, fallbackGasLimit uint64) (common.Hash, error) {
+func (s *Sender) SendTransaction(contextID string, target *common.Address, data []byte, blobs []*kzg4844.Blob) (common.Hash, uint64, error) {
 	s.metrics.sendTransactionTotal.WithLabelValues(s.service, s.name).Inc()
 	var (
 		feeData *FeeData
-		tx      *gethTypes.Transaction
 		sidecar *gethTypes.BlobTxSidecar
 		err     error
 	)
 
-	if blob != nil {
+	blockNumber, blockTimestamp, baseFee, blobBaseFee, err := s.getBlockNumberAndTimestampAndBaseFeeAndBlobFee(s.ctx)
+	if err != nil {
+		log.Error("failed to get block number and base fee", "error", err)
+		return common.Hash{}, 0, fmt.Errorf("failed to get block number and base fee, err: %w", err)
+	}
+
+	if blobs != nil {
 		// check that number of pending blob-carrying txs is not too big
 		if s.senderType == types.SenderTypeCommitBatch {
 			var numPendingTransactions int64
@@ -195,55 +306,76 @@ func (s *Sender) SendTransaction(contextID string, target *common.Address, data 
 			numPendingTransactions, err = s.pendingTransactionOrm.GetCountPendingTransactionsBySenderType(s.ctx, s.senderType)
 			if err != nil {
 				log.Error("failed to count pending transactions", "err: %w", err)
-				return common.Hash{}, fmt.Errorf("failed to count pending transactions, err: %w", err)
+				return common.Hash{}, 0, fmt.Errorf("failed to count pending transactions, err: %w", err)
 			}
 			if numPendingTransactions >= s.config.MaxPendingBlobTxs {
-				return common.Hash{}, ErrTooManyPendingBlobTxs
+				return common.Hash{}, 0, ErrTooManyPendingBlobTxs
 			}
-
 		}
-		sidecar, err = makeSidecar(blob)
+
+		if blockTimestamp < s.config.FusakaTimestamp && (s.config.FusakaTimestamp-blockTimestamp) < 180 {
+			return common.Hash{}, 0, fmt.Errorf("pausing blob txs before Fusaka upgrade, eta %d seconds", s.config.FusakaTimestamp-blockTimestamp)
+		}
+
+		version := gethTypes.BlobSidecarVersion0
+		if blockTimestamp >= s.config.FusakaTimestamp {
+			version = gethTypes.BlobSidecarVersion1
+		}
+
+		sidecar, err = makeSidecar(version, blobs)
 		if err != nil {
 			log.Error("failed to make sidecar for blob transaction", "error", err)
-			return common.Hash{}, fmt.Errorf("failed to make sidecar for blob transaction, err: %w", err)
+			return common.Hash{}, 0, fmt.Errorf("failed to make sidecar for blob transaction, err: %w", err)
 		}
 	}
 
-	blockNumber, baseFee, blobBaseFee, err := s.getBlockNumberAndBaseFeeAndBlobFee(s.ctx)
-	if err != nil {
-		log.Error("failed to get block number and base fee", "error", err)
-		return common.Hash{}, fmt.Errorf("failed to get block number and base fee, err: %w", err)
-	}
-
-	if feeData, err = s.getFeeData(target, data, sidecar, baseFee, blobBaseFee, fallbackGasLimit); err != nil {
+	if feeData, err = s.getFeeData(target, data, sidecar, baseFee, blobBaseFee); err != nil {
 		s.metrics.sendTransactionFailureGetFee.WithLabelValues(s.service, s.name).Inc()
-		log.Error("failed to get fee data", "from", s.auth.From.String(), "nonce", s.auth.Nonce.Uint64(), "fallback gas limit", fallbackGasLimit, "err", err)
-		return common.Hash{}, fmt.Errorf("failed to get fee data, err: %w", err)
+		log.Error("failed to get fee data", "from", s.transactionSigner.GetAddr().String(), "nonce", s.transactionSigner.GetNonce(), "err", err)
+		return common.Hash{}, 0, fmt.Errorf("failed to get fee data, err: %w", err)
 	}
 
-	if tx, err = s.createAndSendTx(feeData, target, data, sidecar, nil); err != nil {
+	signedTx, err := s.createTx(feeData, target, data, sidecar, s.transactionSigner.GetNonce())
+	if err != nil {
 		s.metrics.sendTransactionFailureSendTx.WithLabelValues(s.service, s.name).Inc()
-		log.Error("failed to create and send tx (non-resubmit case)", "from", s.auth.From.String(), "nonce", s.auth.Nonce.Uint64(), "err", err)
-		return common.Hash{}, fmt.Errorf("failed to create and send transaction, err: %w", err)
+		log.Error("failed to create signed tx (non-resubmit case)", "from", s.transactionSigner.GetAddr().String(), "nonce", s.transactionSigner.GetNonce(), "err", err)
+		return common.Hash{}, 0, fmt.Errorf("failed to create signed transaction, err: %w", err)
 	}
 
-	if err = s.pendingTransactionOrm.InsertPendingTransaction(s.ctx, contextID, s.getSenderMeta(), tx, blockNumber); err != nil {
-		log.Error("failed to insert transaction", "from", s.auth.From.String(), "nonce", s.auth.Nonce.Uint64(), "err", err)
-		return common.Hash{}, fmt.Errorf("failed to insert transaction, err: %w", err)
+	// Insert the transaction into the pending transaction table.
+	// A corner case is that the transaction is inserted into the table but not sent to the chain, because the server is stopped in the middle.
+	// This case will be handled by the checkPendingTransaction function.
+	if err = s.pendingTransactionOrm.InsertPendingTransaction(s.ctx, contextID, s.getSenderMeta(), signedTx, blockNumber); err != nil {
+		log.Error("failed to insert transaction", "from", s.transactionSigner.GetAddr().String(), "nonce", s.transactionSigner.GetNonce(), "err", err)
+		return common.Hash{}, 0, fmt.Errorf("failed to insert transaction, err: %w", err)
 	}
-	return tx.Hash(), nil
+
+	if err := s.sendTransactionToMultipleClients(signedTx); err != nil {
+		// Delete the transaction from the pending transaction table if it fails to send.
+		if updateErr := s.pendingTransactionOrm.DeleteTransactionByTxHash(s.ctx, signedTx.Hash()); updateErr != nil {
+			log.Error("failed to delete transaction", "tx hash", signedTx.Hash().String(), "from", s.transactionSigner.GetAddr().String(), "nonce", signedTx.Nonce(), "err", updateErr)
+			return common.Hash{}, 0, fmt.Errorf("failed to delete transaction, err: %w", updateErr)
+		}
+
+		log.Error("failed to send tx", "tx hash", signedTx.Hash().String(), "from", s.transactionSigner.GetAddr().String(), "nonce", signedTx.Nonce(), "err", err)
+		// Check if contain nonce, and reset nonce
+		// only reset nonce when it is not from resubmit
+		if strings.Contains(err.Error(), "nonce too low") {
+			if err := s.resetNonce(); err != nil {
+				log.Warn("failed to reset nonce after failed send transaction", "address", s.transactionSigner.GetAddr().String(), "err", err)
+				return common.Hash{}, 0, fmt.Errorf("failed to reset nonce after failed send transaction, err: %w", err)
+			}
+		}
+		return common.Hash{}, 0, fmt.Errorf("failed to send transaction, err: %w", err)
+	}
+
+	s.transactionSigner.SetNonce(signedTx.Nonce() + 1)
+
+	return signedTx.Hash(), blobBaseFee, nil
 }
 
-func (s *Sender) createAndSendTx(feeData *FeeData, target *common.Address, data []byte, sidecar *gethTypes.BlobTxSidecar, overrideNonce *uint64) (*gethTypes.Transaction, error) {
-	var (
-		nonce  = s.auth.Nonce.Uint64()
-		txData gethTypes.TxData
-	)
-
-	// this is a resubmit call, override the nonce
-	if overrideNonce != nil {
-		nonce = *overrideNonce
-	}
+func (s *Sender) createTx(feeData *FeeData, target *common.Address, data []byte, sidecar *gethTypes.BlobTxSidecar, nonce uint64) (*gethTypes.Transaction, error) {
+	var txData gethTypes.TxData
 
 	switch s.config.TxType {
 	case LegacyTxType:
@@ -268,7 +400,7 @@ func (s *Sender) createAndSendTx(feeData *FeeData, target *common.Address, data 
 			}
 		} else {
 			if target == nil {
-				log.Error("blob transaction to address cannot be nil", "address", s.auth.From.String(), "chainID", s.chainID.Uint64(), "nonce", s.auth.Nonce.Uint64())
+				log.Error("blob transaction to address cannot be nil", "address", s.transactionSigner.GetAddr().String(), "chainID", s.chainID.Uint64(), "nonce", s.transactionSigner.GetNonce())
 				return nil, errors.New("blob transaction to address cannot be nil")
 			}
 
@@ -289,19 +421,10 @@ func (s *Sender) createAndSendTx(feeData *FeeData, target *common.Address, data 
 	}
 
 	// sign and send
-	signedTx, err := s.auth.Signer(s.auth.From, gethTypes.NewTx(txData))
+	tx := gethTypes.NewTx(txData)
+	signedTx, err := s.transactionSigner.SignTransaction(s.ctx, tx)
 	if err != nil {
-		log.Error("failed to sign tx", "address", s.auth.From.String(), "err", err)
-		return nil, err
-	}
-
-	if err = s.client.SendTransaction(s.ctx, signedTx); err != nil {
-		log.Error("failed to send tx", "tx hash", signedTx.Hash().String(), "from", s.auth.From.String(), "nonce", signedTx.Nonce(), "err", err)
-		// Check if contain nonce, and reset nonce
-		// only reset nonce when it is not from resubmit
-		if strings.Contains(err.Error(), "nonce too low") && overrideNonce == nil {
-			s.resetNonce(context.Background())
-		}
+		log.Error("failed to sign tx", "address", s.transactionSigner.GetAddr().String(), "err", err)
 		return nil, err
 	}
 
@@ -323,24 +446,52 @@ func (s *Sender) createAndSendTx(feeData *FeeData, target *common.Address, data 
 
 	s.metrics.currentGasLimit.WithLabelValues(s.service, s.name).Set(float64(feeData.gasLimit))
 
-	// update nonce when it is not from resubmit
-	if overrideNonce == nil {
-		s.auth.Nonce = big.NewInt(int64(nonce + 1))
-	}
 	return signedTx, nil
 }
 
-// resetNonce reset nonce if send signed tx failed.
-func (s *Sender) resetNonce(ctx context.Context) {
-	nonce, err := s.client.PendingNonceAt(ctx, s.auth.From)
+// initializeNonce initializes the nonce by taking the maximum of database nonce and pending nonce.
+func (s *Sender) initializeNonce() (uint64, error) {
+	// Get maximum nonce from database
+	dbNonce, err := s.pendingTransactionOrm.GetMaxNonceBySenderAddress(s.ctx, s.transactionSigner.GetAddr().Hex())
 	if err != nil {
-		log.Warn("failed to reset nonce", "address", s.auth.From.String(), "err", err)
-		return
+		return 0, fmt.Errorf("failed to get max nonce from database for address %s, err: %w", s.transactionSigner.GetAddr().Hex(), err)
 	}
-	s.auth.Nonce = big.NewInt(int64(nonce))
+
+	// Get pending nonce from the client
+	pendingNonce, err := s.client.PendingNonceAt(s.ctx, s.transactionSigner.GetAddr())
+	if err != nil {
+		return 0, fmt.Errorf("failed to get pending nonce for address %s, err: %w", s.transactionSigner.GetAddr().Hex(), err)
+	}
+
+	// Take the maximum of pending nonce and (db nonce + 1)
+	// Database stores the used nonce, so the next available nonce should be dbNonce + 1
+	// When dbNonce is -1 (no records), dbNonce + 1 = 0, which is correct
+	nextDbNonce := uint64(dbNonce + 1)
+	var finalNonce uint64
+	if pendingNonce > nextDbNonce {
+		finalNonce = pendingNonce
+	} else {
+		finalNonce = nextDbNonce
+	}
+
+	log.Info("nonce initialization", "address", s.transactionSigner.GetAddr().Hex(), "maxDbNonce", dbNonce, "nextDbNonce", nextDbNonce, "pendingNonce", pendingNonce, "finalNonce", finalNonce)
+
+	return finalNonce, nil
 }
 
-func (s *Sender) resubmitTransaction(tx *gethTypes.Transaction, baseFee, blobBaseFee uint64) (*gethTypes.Transaction, error) {
+// resetNonce reset nonce if send signed tx failed.
+func (s *Sender) resetNonce() error {
+	nonce, err := s.initializeNonce()
+	if err != nil {
+		log.Error("failed to reset nonce", "address", s.transactionSigner.GetAddr().String(), "err", err)
+		return fmt.Errorf("failed to reset nonce, err: %w", err)
+	}
+	log.Info("reset nonce", "address", s.transactionSigner.GetAddr().String(), "nonce", nonce)
+	s.transactionSigner.SetNonce(nonce)
+	return nil
+}
+
+func (s *Sender) createReplacingTransaction(tx *gethTypes.Transaction, baseFee, blobBaseFee uint64) (*gethTypes.Transaction, error) {
 	escalateMultipleNum := new(big.Int).SetUint64(s.config.EscalateMultipleNum)
 	escalateMultipleDen := new(big.Int).SetUint64(s.config.EscalateMultipleDen)
 	maxGasPrice := new(big.Int).SetUint64(s.config.MaxGasPrice)
@@ -349,7 +500,7 @@ func (s *Sender) resubmitTransaction(tx *gethTypes.Transaction, baseFee, blobBas
 	txInfo := map[string]interface{}{
 		"tx_hash": tx.Hash().String(),
 		"tx_type": s.config.TxType,
-		"from":    s.auth.From.String(),
+		"from":    s.transactionSigner.GetAddr().String(),
 		"nonce":   tx.Nonce(),
 	}
 
@@ -360,6 +511,10 @@ func (s *Sender) resubmitTransaction(tx *gethTypes.Transaction, baseFee, blobBas
 		originalGasPrice := tx.GasPrice()
 		gasPrice := new(big.Int).Mul(originalGasPrice, escalateMultipleNum)
 		gasPrice = new(big.Int).Div(gasPrice, escalateMultipleDen)
+		baseFeeInt := new(big.Int).SetUint64(baseFee)
+		if gasPrice.Cmp(baseFeeInt) < 0 {
+			gasPrice = baseFeeInt
+		}
 		if gasPrice.Cmp(maxGasPrice) > 0 {
 			gasPrice = maxGasPrice
 		}
@@ -452,6 +607,15 @@ func (s *Sender) resubmitTransaction(tx *gethTypes.Transaction, baseFee, blobBas
 				blobGasFeeCap = maxBlobGasPrice
 			}
 
+			// Check if any fee cap is less than double
+			doubledTipCap := new(big.Int).Mul(originalGasTipCap, big.NewInt(2))
+			doubledFeeCap := new(big.Int).Mul(originalGasFeeCap, big.NewInt(2))
+			doubledBlobFeeCap := new(big.Int).Mul(originalBlobGasFeeCap, big.NewInt(2))
+			if gasTipCap.Cmp(doubledTipCap) < 0 || gasFeeCap.Cmp(doubledFeeCap) < 0 || blobGasFeeCap.Cmp(doubledBlobFeeCap) < 0 {
+				log.Error("gas fees must be at least double", "originalTipCap", originalGasTipCap, "currentTipCap", gasTipCap, "requiredTipCap", doubledTipCap, "originalFeeCap", originalGasFeeCap, "currentFeeCap", gasFeeCap, "requiredFeeCap", doubledFeeCap, "originalBlobFeeCap", originalBlobGasFeeCap, "currentBlobFeeCap", blobGasFeeCap, "requiredBlobFeeCap", doubledBlobFeeCap)
+				return nil, errors.New("gas fees must be at least double")
+			}
+
 			feeData.gasFeeCap = gasFeeCap
 			feeData.gasTipCap = gasTipCap
 			feeData.blobGasFeeCap = blobGasFeeCap
@@ -471,12 +635,16 @@ func (s *Sender) resubmitTransaction(tx *gethTypes.Transaction, baseFee, blobBas
 
 	nonce := tx.Nonce()
 	s.metrics.resubmitTransactionTotal.WithLabelValues(s.service, s.name).Inc()
-	tx, err := s.createAndSendTx(&feeData, tx.To(), tx.Data(), tx.BlobTxSidecar(), &nonce)
+
+	// Note: This might fail during the Fusaka upgrade, if we originally sent a V0 blob tx.
+	// Normally we would need to convert it to V1 before resubmitting. However, this case is
+	// unlikely and geth would still accept the V0 version, so we omit the conversion.
+	signedTx, err := s.createTx(&feeData, tx.To(), tx.Data(), tx.BlobTxSidecar(), nonce)
 	if err != nil {
-		log.Error("failed to create and send tx (resubmit case)", "from", s.auth.From.String(), "nonce", nonce, "err", err)
+		log.Error("failed to create signed tx (resubmit case)", "from", s.transactionSigner.GetAddr().String(), "nonce", nonce, "err", err)
 		return nil, err
 	}
-	return tx, nil
+	return signedTx, nil
 }
 
 // checkPendingTransaction checks the confirmation status of pending transactions against the latest confirmed block number.
@@ -484,7 +652,7 @@ func (s *Sender) resubmitTransaction(tx *gethTypes.Transaction, baseFee, blobBas
 func (s *Sender) checkPendingTransaction() {
 	s.metrics.senderCheckPendingTransactionTotal.WithLabelValues(s.service, s.name).Inc()
 
-	blockNumber, baseFee, blobBaseFee, err := s.getBlockNumberAndBaseFeeAndBlobFee(s.ctx)
+	blockNumber, _, baseFee, blobBaseFee, err := s.getBlockNumberAndTimestampAndBaseFeeAndBlobFee(s.ctx)
 	if err != nil {
 		log.Error("failed to get block number and base fee", "error", err)
 		return
@@ -503,30 +671,29 @@ func (s *Sender) checkPendingTransaction() {
 	}
 
 	for _, txnToCheck := range transactionsToCheck {
-		tx := new(gethTypes.Transaction)
-		if err := tx.DecodeRLP(rlp.NewStream(bytes.NewReader(txnToCheck.RLPEncoding), 0)); err != nil {
+		originalTx := new(gethTypes.Transaction)
+		if err := originalTx.DecodeRLP(rlp.NewStream(bytes.NewReader(txnToCheck.RLPEncoding), 0)); err != nil {
 			log.Error("failed to decode RLP", "context ID", txnToCheck.ContextID, "sender meta", s.getSenderMeta(), "err", err)
 			continue
 		}
 
-		receipt, err := s.client.TransactionReceipt(s.ctx, tx.Hash())
+		receipt, err := s.client.TransactionReceipt(s.ctx, originalTx.Hash())
 		if err == nil { // tx confirmed.
 			if receipt.BlockNumber.Uint64() <= confirmed {
-				err := s.db.Transaction(func(dbTX *gorm.DB) error {
+				if dbTxErr := s.db.Transaction(func(dbTX *gorm.DB) error {
 					// Update the status of the transaction to TxStatusConfirmed.
-					if err := s.pendingTransactionOrm.UpdatePendingTransactionStatusByTxHash(s.ctx, tx.Hash(), types.TxStatusConfirmed, dbTX); err != nil {
-						log.Error("failed to update transaction status by tx hash", "hash", tx.Hash().String(), "sender meta", s.getSenderMeta(), "from", s.auth.From.String(), "nonce", tx.Nonce(), "err", err)
-						return err
+					if updateErr := s.pendingTransactionOrm.UpdateTransactionStatusByTxHash(s.ctx, originalTx.Hash(), types.TxStatusConfirmed, dbTX); updateErr != nil {
+						log.Error("failed to update transaction status by tx hash", "hash", originalTx.Hash().String(), "sender meta", s.getSenderMeta(), "from", s.transactionSigner.GetAddr().String(), "nonce", originalTx.Nonce(), "err", updateErr)
+						return updateErr
 					}
 					// Update other transactions with the same nonce and sender address as failed.
-					if err := s.pendingTransactionOrm.UpdateOtherTransactionsAsFailedByNonce(s.ctx, txnToCheck.SenderAddress, tx.Nonce(), tx.Hash(), dbTX); err != nil {
-						log.Error("failed to update other transactions as failed by nonce", "senderAddress", txnToCheck.SenderAddress, "nonce", tx.Nonce(), "excludedTxHash", tx.Hash(), "err", err)
-						return err
+					if updateErr := s.pendingTransactionOrm.UpdateOtherTransactionsAsFailedByNonce(s.ctx, txnToCheck.SenderAddress, originalTx.Nonce(), originalTx.Hash(), dbTX); updateErr != nil {
+						log.Error("failed to update other transactions as failed by nonce", "senderAddress", txnToCheck.SenderAddress, "nonce", originalTx.Nonce(), "excludedTxHash", originalTx.Hash(), "err", updateErr)
+						return updateErr
 					}
 					return nil
-				})
-				if err != nil {
-					log.Error("db transaction failed after receiving confirmation", "err", err)
+				}); dbTxErr != nil {
+					log.Error("db transaction failed after receiving confirmation", "err", dbTxErr)
 					return
 				}
 
@@ -534,7 +701,7 @@ func (s *Sender) checkPendingTransaction() {
 				s.confirmCh <- &Confirmation{
 					ContextID:    txnToCheck.ContextID,
 					IsSuccessful: receipt.Status == gethTypes.ReceiptStatusSuccessful,
-					TxHash:       tx.Hash(),
+					TxHash:       originalTx.Hash(),
 					SenderType:   s.senderType,
 				}
 			}
@@ -551,52 +718,87 @@ func (s *Sender) checkPendingTransaction() {
 
 			// early return if the previous transaction has not been confirmed yet.
 			// currentNonce is already the confirmed nonce + 1.
-			if tx.Nonce() > currentNonce {
-				log.Debug("previous transaction not yet confirmed, skip bumping gas price", "address", txnToCheck.SenderAddress, "currentNonce", currentNonce, "txNonce", tx.Nonce())
+			if originalTx.Nonce() > currentNonce {
+				log.Debug("previous transaction not yet confirmed, skip bumping gas price", "address", txnToCheck.SenderAddress, "currentNonce", currentNonce, "txNonce", originalTx.Nonce())
 				continue
 			}
 
 			// It's possible that the pending transaction was marked as failed earlier in this loop (e.g., if one of its replacements has already been confirmed).
 			// Therefore, we fetch the current transaction status again for accuracy before proceeding.
-			status, err := s.pendingTransactionOrm.GetTxStatusByTxHash(s.ctx, tx.Hash())
+			status, err := s.pendingTransactionOrm.GetTxStatusByTxHash(s.ctx, originalTx.Hash())
 			if err != nil {
-				log.Error("failed to get transaction status by tx hash", "hash", tx.Hash().String(), "err", err)
+				log.Error("failed to get transaction status by tx hash", "hash", originalTx.Hash().String(), "err", err)
 				return
 			}
 			if status == types.TxStatusConfirmedFailed {
-				log.Warn("transaction already marked as failed, skipping resubmission", "hash", tx.Hash().String())
+				log.Warn("transaction already marked as failed, skipping resubmission", "hash", originalTx.Hash().String())
 				continue
 			}
 
 			log.Info("resubmit transaction",
 				"service", s.service,
 				"name", s.name,
-				"hash", tx.Hash().String(),
-				"from", s.auth.From.String(),
-				"nonce", tx.Nonce(),
+				"hash", originalTx.Hash().String(),
+				"from", s.transactionSigner.GetAddr().String(),
+				"nonce", originalTx.Nonce(),
 				"submitBlockNumber", txnToCheck.SubmitBlockNumber,
 				"currentBlockNumber", blockNumber,
 				"escalateBlocks", s.config.EscalateBlocks)
 
-			if newTx, err := s.resubmitTransaction(tx, baseFee, blobBaseFee); err != nil {
+			newSignedTx, err := s.createReplacingTransaction(originalTx, baseFee, blobBaseFee)
+			if err != nil {
 				s.metrics.resubmitTransactionFailedTotal.WithLabelValues(s.service, s.name).Inc()
-				log.Error("failed to resubmit transaction", "context ID", txnToCheck.ContextID, "sender meta", s.getSenderMeta(), "from", s.auth.From.String(), "nonce", tx.Nonce(), "err", err)
-			} else {
-				err := s.db.Transaction(func(dbTX *gorm.DB) error {
-					// Update the status of the original transaction as replaced, while still checking its confirmation status.
-					if err := s.pendingTransactionOrm.UpdatePendingTransactionStatusByTxHash(s.ctx, tx.Hash(), types.TxStatusReplaced, dbTX); err != nil {
-						return fmt.Errorf("failed to update status of transaction with hash %s to TxStatusReplaced, err: %w", tx.Hash().String(), err)
+				log.Error("failed to resubmit transaction", "context ID", txnToCheck.ContextID, "sender meta", s.getSenderMeta(), "from", s.transactionSigner.GetAddr().String(), "nonce", originalTx.Nonce(), "err", err)
+				return
+			}
+
+			// Update the status of the original transaction as replaced, while still checking its confirmation status.
+			// Insert the new transaction that has replaced the original one, and set the status as pending.
+			// A corner case is that the transaction is inserted into the table but not sent to the chain, because the server is stopped in the middle.
+			// This case will be handled by the checkPendingTransaction function.
+			if dbTxErr := s.db.Transaction(func(dbTX *gorm.DB) error {
+				if updateErr := s.pendingTransactionOrm.UpdateTransactionStatusByTxHash(s.ctx, originalTx.Hash(), types.TxStatusReplaced, dbTX); updateErr != nil {
+					return fmt.Errorf("failed to update status of transaction with hash %s to TxStatusReplaced, err: %w", newSignedTx.Hash().String(), updateErr)
+				}
+				if updateErr := s.pendingTransactionOrm.InsertPendingTransaction(s.ctx, txnToCheck.ContextID, s.getSenderMeta(), newSignedTx, blockNumber, dbTX); updateErr != nil {
+					return fmt.Errorf("failed to insert new pending transaction with context ID: %s, nonce: %d, hash: %v, previous block number: %v, current block number: %v, err: %w", txnToCheck.ContextID, newSignedTx.Nonce(), newSignedTx.Hash().String(), txnToCheck.SubmitBlockNumber, blockNumber, updateErr)
+				}
+				return nil
+			}); dbTxErr != nil {
+				log.Error("db transaction failed after resubmitting", "err", dbTxErr)
+				return
+			}
+
+			if err := s.sendTransactionToMultipleClients(newSignedTx); err != nil {
+				if strings.Contains(err.Error(), "nonce too low") {
+					// When we receive a 'nonce too low' error but cannot find the transaction receipt, it indicates another transaction with this nonce has already been processed, so this transaction will never be mined and should be marked as failed.
+					log.Warn("nonce too low detected, marking all non-confirmed transactions with same nonce as failed", "nonce", originalTx.Nonce(), "address", s.transactionSigner.GetAddr().Hex(), "txHash", originalTx.Hash().Hex(), "newTxHash", newSignedTx.Hash().Hex(), "err", err)
+					txHashes := []string{originalTx.Hash().Hex(), newSignedTx.Hash().Hex()}
+					if updateErr := s.pendingTransactionOrm.UpdateTransactionStatusByTxHashes(s.ctx, txHashes, types.TxStatusConfirmedFailed); updateErr != nil {
+						log.Error("failed to update transaction status", "hashes", txHashes, "err", updateErr)
+						return
 					}
-					// Record the new transaction that has replaced the original one.
-					if err := s.pendingTransactionOrm.InsertPendingTransaction(s.ctx, txnToCheck.ContextID, s.getSenderMeta(), newTx, blockNumber, dbTX); err != nil {
-						return fmt.Errorf("failed to insert new pending transaction with context ID: %s, nonce: %d, hash: %v, previous block number: %v, current block number: %v, err: %w", txnToCheck.ContextID, newTx.Nonce(), newTx.Hash().String(), txnToCheck.SubmitBlockNumber, blockNumber, err)
-					}
-					return nil
-				})
-				if err != nil {
-					log.Error("db transaction failed after resubmitting", "err", err)
 					return
 				}
+				// SendTransaction failed, need to rollback the previous database changes
+				if rollbackErr := s.db.Transaction(func(tx *gorm.DB) error {
+					// Restore original transaction status back to pending
+					if updateErr := s.pendingTransactionOrm.UpdateTransactionStatusByTxHash(s.ctx, originalTx.Hash(), types.TxStatusPending, tx); updateErr != nil {
+						return fmt.Errorf("failed to rollback status of original transaction, err: %w", updateErr)
+					}
+					// Delete the new transaction that was inserted
+					if updateErr := s.pendingTransactionOrm.DeleteTransactionByTxHash(s.ctx, newSignedTx.Hash(), tx); updateErr != nil {
+						return fmt.Errorf("failed to delete new transaction, err: %w", updateErr)
+					}
+					return nil
+				}); rollbackErr != nil {
+					// Both SendTransaction and rollback failed
+					log.Error("failed to rollback database after SendTransaction failed", "tx hash", newSignedTx.Hash().String(), "from", s.transactionSigner.GetAddr().String(), "nonce", newSignedTx.Nonce(), "sendTxErr", err, "rollbackErr", rollbackErr)
+					return
+				}
+
+				log.Error("failed to send replacing tx", "tx hash", newSignedTx.Hash().String(), "from", s.transactionSigner.GetAddr().String(), "nonce", newSignedTx.Nonce(), "err", err)
+				return
 			}
 		}
 	}
@@ -623,15 +825,15 @@ func (s *Sender) getSenderMeta() *orm.SenderMeta {
 	return &orm.SenderMeta{
 		Name:    s.name,
 		Service: s.service,
-		Address: s.auth.From,
+		Address: s.transactionSigner.GetAddr(),
 		Type:    s.senderType,
 	}
 }
 
-func (s *Sender) getBlockNumberAndBaseFeeAndBlobFee(ctx context.Context) (uint64, uint64, uint64, error) {
-	header, err := s.client.HeaderByNumber(ctx, nil)
+func (s *Sender) getBlockNumberAndTimestampAndBaseFeeAndBlobFee(ctx context.Context) (uint64, uint64, uint64, uint64, error) {
+	header, err := s.client.HeaderByNumber(ctx, big.NewInt(rpc.PendingBlockNumber.Int64()))
 	if err != nil {
-		return 0, 0, 0, fmt.Errorf("failed to get header by number, err: %w", err)
+		return 0, 0, 0, 0, fmt.Errorf("failed to get header by number, err: %w", err)
 	}
 
 	var baseFee uint64
@@ -640,40 +842,68 @@ func (s *Sender) getBlockNumberAndBaseFeeAndBlobFee(ctx context.Context) (uint64
 	}
 
 	var blobBaseFee uint64
-	if header.ExcessBlobGas != nil && header.BlobGasUsed != nil {
-		parentExcessBlobGas := misc.CalcExcessBlobGas(*header.ExcessBlobGas, *header.BlobGasUsed)
-		blobBaseFee = misc.CalcBlobFee(parentExcessBlobGas).Uint64()
+	if excess := header.ExcessBlobGas; excess != nil {
+		// Leave it up to the L1 node to compute the correct blob base fee.
+		// Previously we would compute it locally using `CalcBlobFee`, but
+		// that approach requires syncing any future L1 configuration changes.
+		// Note: The fetched blob base fee might not correspond to the block
+		// that we fetched in the previous step, but this is acceptable.
+		var blobBaseFeeHex hexutil.Big
+		if err := s.rpcClient.CallContext(ctx, &blobBaseFeeHex, "eth_blobBaseFee"); err != nil {
+			return 0, 0, 0, 0, fmt.Errorf("failed to call eth_blobBaseFee, err: %w", err)
+		}
+		// A correct L1 node could not return a value that overflows uint64
+		blobBaseFee = blobBaseFeeHex.ToInt().Uint64()
 	}
-	return header.Number.Uint64(), baseFee, blobBaseFee, nil
+
+	// header.Number.Uint64() returns the pendingBlockNumber, so we minus 1 to get the latestBlockNumber.
+	return header.Number.Uint64() - 1, header.Time, baseFee, blobBaseFee, nil
 }
 
-func makeSidecar(blob *kzg4844.Blob) (*gethTypes.BlobTxSidecar, error) {
-	if blob == nil {
-		return nil, errors.New("blob cannot be nil")
+func makeSidecar(version byte, blobsInput []*kzg4844.Blob) (*gethTypes.BlobTxSidecar, error) {
+	if len(blobsInput) == 0 {
+		return nil, errors.New("blobsInput is empty")
 	}
 
-	blobs := []kzg4844.Blob{*blob}
+	blobs := make([]kzg4844.Blob, len(blobsInput))
+	for i, blob := range blobsInput {
+		if blob == nil {
+			return nil, fmt.Errorf("blob at index %d is nil", i)
+		}
+		blobs[i] = *blob
+	}
+
 	var commitments []kzg4844.Commitment
 	var proofs []kzg4844.Proof
 
 	for i := range blobs {
+		// Calculate commitment
 		c, err := kzg4844.BlobToCommitment(&blobs[i])
 		if err != nil {
 			return nil, fmt.Errorf("failed to get blob commitment, err: %w", err)
 		}
-
-		p, err := kzg4844.ComputeBlobProof(&blobs[i], c)
-		if err != nil {
-			return nil, fmt.Errorf("failed to compute blob proof, err: %w", err)
-		}
-
 		commitments = append(commitments, c)
-		proofs = append(proofs, p)
+
+		// Calculate proof
+		switch version {
+		case gethTypes.BlobSidecarVersion0:
+			p, err := kzg4844.ComputeBlobProof(&blobs[i], c)
+			if err != nil {
+				return nil, fmt.Errorf("failed to compute v0 blob proof, err: %w", err)
+			}
+			proofs = append(proofs, p)
+
+		case gethTypes.BlobSidecarVersion1:
+			ps, err := kzg4844.ComputeCellProofs(&blobs[i])
+			if err != nil {
+				return nil, fmt.Errorf("failed to compute v1 blob cell proofs, err: %w", err)
+			}
+			proofs = append(proofs, ps...)
+
+		default:
+			return nil, fmt.Errorf("unsupported blob sidecar version: %d", version)
+		}
 	}
 
-	return &gethTypes.BlobTxSidecar{
-		Blobs:       blobs,
-		Commitments: commitments,
-		Proofs:      proofs,
-	}, nil
+	return gethTypes.NewBlobTxSidecar(version, blobs, commitments, proofs), nil
 }

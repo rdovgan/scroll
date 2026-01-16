@@ -41,7 +41,7 @@ func (g *gormLogger) Error(_ context.Context, msg string, data ...interface{}) {
 func (g *gormLogger) Trace(_ context.Context, begin time.Time, fc func() (string, int64), err error) {
 	elapsed := time.Since(begin)
 	sql, rowsAffected := fc()
-	g.gethLogger.Debug("gorm", "line", utils.FileWithLineNum(), "cost", elapsed, "sql", sql, "rowsAffected", rowsAffected, "err", err)
+	g.gethLogger.Trace("gorm", "line", utils.FileWithLineNum(), "cost", elapsed, "sql", sql, "rowsAffected", rowsAffected, "err", err)
 }
 
 // InitDB init the db handler
@@ -51,7 +51,8 @@ func InitDB(config *Config) (*gorm.DB, error) {
 	}
 
 	db, err := gorm.Open(postgres.Open(config.DSN), &gorm.Config{
-		Logger: &tmpGormLogger,
+		CreateBatchSize: 1000,
+		Logger:          &tmpGormLogger,
 		NowFunc: func() time.Time {
 			// why set time to UTC.
 			// if now set this, the inserted data time will use local timezone. like 2023-07-18 18:24:00 CST+8

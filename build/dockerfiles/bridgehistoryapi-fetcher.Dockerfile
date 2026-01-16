@@ -1,5 +1,5 @@
 # Download Go dependencies
-FROM scrolltech/go-rust-builder:go-1.21-rust-nightly-2023-12-03 as base
+FROM scrolltech/go-rust-builder:go-1.22-rust-nightly-2023-12-03 as base
 
 WORKDIR /src
 COPY go.mod* ./
@@ -17,7 +17,7 @@ RUN --mount=target=. \
 FROM ubuntu:20.04
 
 ENV CGO_LDFLAGS="-Wl,--no-as-needed -ldl"
-RUN apt update && apt install ca-certificates -y
+RUN apt update && apt install ca-certificates vim netcat-openbsd net-tools curl -y
 RUN update-ca-certificates
 COPY --from=builder /bin/bridgehistoryapi-fetcher /bin/
 WORKDIR /app

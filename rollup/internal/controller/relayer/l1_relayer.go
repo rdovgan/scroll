@@ -10,10 +10,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/scroll-tech/go-ethereum/accounts/abi"
-	"github.com/scroll-tech/go-ethereum/common"
-	"github.com/scroll-tech/go-ethereum/crypto"
 	"github.com/scroll-tech/go-ethereum/log"
-	"github.com/scroll-tech/go-ethereum/params"
 	"gorm.io/gorm"
 
 	"scroll-tech/common/types"
@@ -23,6 +20,7 @@ import (
 	"scroll-tech/rollup/internal/config"
 	"scroll-tech/rollup/internal/controller/sender"
 	"scroll-tech/rollup/internal/orm"
+	rutils "scroll-tech/rollup/internal/utils"
 )
 
 // Layer1Relayer is responsible for updating L1 gas price oracle contract on L2.
@@ -31,18 +29,15 @@ import (
 type Layer1Relayer struct {
 	ctx context.Context
 
-	cfg      *config.RelayerConfig
-	chainCfg *params.ChainConfig
+	cfg *config.RelayerConfig
 
 	gasOracleSender *sender.Sender
 	l1GasOracleABI  *abi.ABI
 
-	lastBaseFee         uint64
-	lastBlobBaseFee     uint64
-	minGasPrice         uint64
-	gasPriceDiff        uint64
-	l1BaseFeeWeight     float64
-	l1BlobBaseFeeWeight float64
+	lastBaseFee     uint64
+	lastBlobBaseFee uint64
+	minGasPrice     uint64
+	gasPriceDiff    uint64
 
 	l1BlockOrm *orm.L1Block
 	l2BlockOrm *orm.L2Block
@@ -52,20 +47,15 @@ type Layer1Relayer struct {
 }
 
 // NewLayer1Relayer will return a new instance of Layer1RelayerClient
-func NewLayer1Relayer(ctx context.Context, db *gorm.DB, cfg *config.RelayerConfig, chainCfg *params.ChainConfig, serviceType ServiceType, reg prometheus.Registerer) (*Layer1Relayer, error) {
+func NewLayer1Relayer(ctx context.Context, db *gorm.DB, cfg *config.RelayerConfig, serviceType ServiceType, reg prometheus.Registerer) (*Layer1Relayer, error) {
 	var gasOracleSender *sender.Sender
+	var err error
 
 	switch serviceType {
 	case ServiceTypeL1GasOracle:
-		pKey, err := crypto.ToECDSA(common.FromHex(cfg.GasOracleSenderPrivateKey))
+		gasOracleSender, err = sender.NewSender(ctx, cfg.SenderConfig, cfg.GasOracleSenderSignerConfig, "l1_relayer", "gas_oracle_sender", types.SenderTypeL1GasOracle, db, reg)
 		if err != nil {
-			return nil, fmt.Errorf("new gas oracle sender failed, err: %v", err)
-		}
-
-		gasOracleSender, err = sender.NewSender(ctx, cfg.SenderConfig, pKey, "l1_relayer", "gas_oracle_sender", types.SenderTypeL1GasOracle, db, reg)
-		if err != nil {
-			addr := crypto.PubkeyToAddress(pKey.PublicKey)
-			return nil, fmt.Errorf("new gas oracle sender failed for address %s, err: %v", addr.Hex(), err)
+			return nil, fmt.Errorf("new gas oracle sender failed, err: %w", err)
 		}
 
 		// Ensure test features aren't enabled on the scroll mainnet.
@@ -88,7 +78,6 @@ func NewLayer1Relayer(ctx context.Context, db *gorm.DB, cfg *config.RelayerConfi
 
 	l1Relayer := &Layer1Relayer{
 		cfg:        cfg,
-		chainCfg:   chainCfg,
 		ctx:        ctx,
 		l1BlockOrm: orm.NewL1Block(db),
 		l2BlockOrm: orm.NewL2Block(db),
@@ -97,10 +86,8 @@ func NewLayer1Relayer(ctx context.Context, db *gorm.DB, cfg *config.RelayerConfi
 		gasOracleSender: gasOracleSender,
 		l1GasOracleABI:  bridgeAbi.L1GasPriceOracleABI,
 
-		minGasPrice:         minGasPrice,
-		gasPriceDiff:        gasPriceDiff,
-		l1BaseFeeWeight:     cfg.GasOracleConfig.L1BaseFeeWeight,
-		l1BlobBaseFeeWeight: cfg.GasOracleConfig.L1BlobBaseFeeWeight,
+		minGasPrice:  minGasPrice,
+		gasPriceDiff: gasPriceDiff,
 	}
 
 	l1Relayer.metrics = initL1RelayerMetrics(reg)
@@ -138,62 +125,79 @@ func (r *Layer1Relayer) ProcessGasPriceOracle() {
 	block := blocks[0]
 
 	if types.GasOracleStatus(block.GasOracleStatus) == types.GasOraclePending {
-		latestL2Height, err := r.l2BlockOrm.GetL2BlocksLatestHeight(r.ctx)
-		if err != nil {
-			log.Warn("Failed to fetch latest L2 block height from db", "err", err)
+		if block.BaseFee == 0 || block.BlobBaseFee == 0 {
+			log.Error("Invalid base fee or blob base fee", "block.Hash", block.Hash, "block.Height", block.Number, "block.BaseFee", block.BaseFee, "block.BlobBaseFee", block.BlobBaseFee)
 			return
 		}
 
-		var isBernoulli = block.BlobBaseFee > 0 && r.chainCfg.IsBernoulli(new(big.Int).SetUint64(latestL2Height))
-		var isCurie = block.BlobBaseFee > 0 && r.chainCfg.IsCurie(new(big.Int).SetUint64(latestL2Height))
+		baseFee := block.BaseFee
+		blobBaseFee := block.BlobBaseFee
 
-		var baseFee uint64
-		var blobBaseFee uint64
-		if isCurie {
-			baseFee = block.BaseFee
-			blobBaseFee = block.BlobBaseFee
-		} else if isBernoulli {
-			baseFee = uint64(math.Ceil(r.l1BaseFeeWeight*float64(block.BaseFee) + r.l1BlobBaseFeeWeight*float64(block.BlobBaseFee)))
-		} else {
-			baseFee = block.BaseFee
+		// include the token exchange rate in the fee data if alternative gas token enabled
+		if r.cfg.GasOracleConfig.AlternativeGasTokenConfig != nil && r.cfg.GasOracleConfig.AlternativeGasTokenConfig.Enabled {
+			// The exchange rate represent the number of native token on L1 required to exchange for 1 native token on L2.
+			var exchangeRate float64
+			switch r.cfg.GasOracleConfig.AlternativeGasTokenConfig.Mode {
+			case "Fixed":
+				exchangeRate = r.cfg.GasOracleConfig.AlternativeGasTokenConfig.FixedExchangeRate
+			case "BinanceApi":
+				exchangeRate, err = rutils.GetExchangeRateFromBinanceApi(r.cfg.GasOracleConfig.AlternativeGasTokenConfig.TokenSymbolPair, 5)
+				if err != nil {
+					log.Error("Failed to get gas token exchange rate from Binance api", "tokenSymbolPair", r.cfg.GasOracleConfig.AlternativeGasTokenConfig.TokenSymbolPair, "err", err)
+					return
+				}
+			default:
+				log.Error("Invalid alternative gas token mode", "mode", r.cfg.GasOracleConfig.AlternativeGasTokenConfig.Mode)
+				return
+			}
+			if exchangeRate == 0 {
+				log.Error("Invalid exchange rate", "exchangeRate", exchangeRate)
+				return
+			}
+			baseFee = uint64(math.Ceil(float64(baseFee) / exchangeRate))
+			blobBaseFee = uint64(math.Ceil(float64(blobBaseFee) / exchangeRate))
 		}
 
-		if r.shouldUpdateGasOracle(baseFee, blobBaseFee, isCurie) {
+		if r.shouldUpdateGasOracle(baseFee, blobBaseFee) {
 			// It indicates the committing batch has been stuck for a long time, it's likely that the L1 gas fee spiked.
 			// If we are not committing batches due to high fees then we shouldn't update fees to prevent users from paying high l1_data_fee
 			// Also, set fees to some default value, because we have already updated fees to some high values, probably
 			var reachTimeout bool
-			if reachTimeout, err = r.commitBatchReachTimeout(); reachTimeout && err == nil {
+			if reachTimeout, err = r.commitBatchReachTimeout(); reachTimeout && block.BlobBaseFee > r.cfg.GasOracleConfig.L1BlobBaseFeeThreshold && err == nil {
 				if r.lastBaseFee == r.cfg.GasOracleConfig.L1BaseFeeDefault && r.lastBlobBaseFee == r.cfg.GasOracleConfig.L1BlobBaseFeeDefault {
 					return
 				}
+				log.Warn("The committing batch has been stuck for a long time, it's likely that the L1 gas fee spiked, set fees to default values", "currentBaseFee", baseFee, "currentBlobBaseFee", blobBaseFee, "threshold (min)", r.cfg.GasOracleConfig.L1BlobBaseFeeThreshold, "defaultBaseFee", r.cfg.GasOracleConfig.L1BaseFeeDefault, "defaultBlobBaseFee", r.cfg.GasOracleConfig.L1BlobBaseFeeDefault)
 				baseFee = r.cfg.GasOracleConfig.L1BaseFeeDefault
 				blobBaseFee = r.cfg.GasOracleConfig.L1BlobBaseFeeDefault
 			} else if err != nil {
 				return
 			}
-			var data []byte
-			if isCurie {
-				data, err = r.l1GasOracleABI.Pack("setL1BaseFeeAndBlobBaseFee", new(big.Int).SetUint64(baseFee), new(big.Int).SetUint64(blobBaseFee))
-				if err != nil {
-					log.Error("Failed to pack setL1BaseFeeAndBlobBaseFee", "block.Hash", block.Hash, "block.Height", block.Number, "block.BaseFee", baseFee, "block.BlobBaseFee", blobBaseFee, "isBernoulli", isBernoulli, "isCurie", isCurie, "err", err)
-					return
-				}
-			} else {
-				data, err = r.l1GasOracleABI.Pack("setL1BaseFee", new(big.Int).SetUint64(baseFee))
-				if err != nil {
-					log.Error("Failed to pack setL1BaseFee", "block.Hash", block.Hash, "block.Height", block.Number, "block.BaseFee", baseFee, "block.BlobBaseFee", blobBaseFee, "isBernoulli", isBernoulli, "isCurie", isCurie, "err", err)
-					return
-				}
+			// Cap base fee update at the configured upper limit
+			if limit := r.cfg.GasOracleConfig.L1BaseFeeLimit; baseFee > limit {
+				log.Error("L1 base fee exceed max limit, set to max limit", "baseFee", baseFee, "maxLimit", limit)
+				r.metrics.rollupL1RelayerGasPriceOracleFeeOverLimitTotal.Inc()
+				baseFee = limit
 			}
-
-			hash, err := r.gasOracleSender.SendTransaction(block.Hash, &r.cfg.GasPriceOracleContractAddress, data, nil, 0)
+			// Cap blob base fee update at the configured upper limit
+			if limit := r.cfg.GasOracleConfig.L1BlobBaseFeeLimit; blobBaseFee > limit {
+				log.Error("L1 blob base fee exceed max limit, set to max limit", "blobBaseFee", blobBaseFee, "maxLimit", limit)
+				r.metrics.rollupL1RelayerGasPriceOracleFeeOverLimitTotal.Inc()
+				blobBaseFee = limit
+			}
+			data, err := r.l1GasOracleABI.Pack("setL1BaseFeeAndBlobBaseFee", new(big.Int).SetUint64(baseFee), new(big.Int).SetUint64(blobBaseFee))
 			if err != nil {
-				log.Error("Failed to send gas oracle update tx to layer2", "block.Hash", block.Hash, "block.Height", block.Number, "block.BaseFee", baseFee, "block.BlobBaseFee", blobBaseFee, "isBernoulli", isBernoulli, "isCurie", isCurie, "err", err)
+				log.Error("Failed to pack setL1BaseFeeAndBlobBaseFee", "block.Hash", block.Hash, "block.Height", block.Number, "block.BaseFee", baseFee, "block.BlobBaseFee", blobBaseFee, "err", err)
 				return
 			}
 
-			err = r.l1BlockOrm.UpdateL1GasOracleStatusAndOracleTxHash(r.ctx, block.Hash, types.GasOracleImporting, hash.String())
+			txHash, _, err := r.gasOracleSender.SendTransaction(block.Hash, &r.cfg.GasPriceOracleContractAddress, data, nil)
+			if err != nil {
+				log.Error("Failed to send gas oracle update tx to layer2", "block.Hash", block.Hash, "block.Height", block.Number, "block.BaseFee", baseFee, "block.BlobBaseFee", blobBaseFee, "err", err)
+				return
+			}
+
+			err = r.l1BlockOrm.UpdateL1GasOracleStatusAndOracleTxHash(r.ctx, block.Hash, types.GasOracleImporting, txHash.String())
 			if err != nil {
 				log.Error("UpdateGasOracleStatusAndOracleTxHash failed", "block.Hash", block.Hash, "block.Height", block.Number, "err", err)
 				return
@@ -203,7 +207,7 @@ func (r *Layer1Relayer) ProcessGasPriceOracle() {
 			r.lastBlobBaseFee = blobBaseFee
 			r.metrics.rollupL1RelayerLatestBaseFee.Set(float64(r.lastBaseFee))
 			r.metrics.rollupL1RelayerLatestBlobBaseFee.Set(float64(r.lastBlobBaseFee))
-			log.Info("Update l1 base fee", "txHash", hash.String(), "baseFee", baseFee, "blobBaseFee", blobBaseFee, "isBernoulli", isBernoulli, "isCurie", isCurie)
+			log.Info("Update l1 base fee", "txHash", txHash.String(), "baseFee", baseFee, "blobBaseFee", blobBaseFee)
 		}
 	}
 }
@@ -252,31 +256,26 @@ func (r *Layer1Relayer) StopSenders() {
 	}
 }
 
-func (r *Layer1Relayer) shouldUpdateGasOracle(baseFee uint64, blobBaseFee uint64, isCurie bool) bool {
+func (r *Layer1Relayer) shouldUpdateGasOracle(baseFee uint64, blobBaseFee uint64) bool {
 	// Right after restarting.
 	if r.lastBaseFee == 0 {
+		log.Info("First time to update gas oracle after restarting", "baseFee", baseFee, "blobBaseFee", blobBaseFee)
 		return true
 	}
 
-	expectedBaseFeeDelta := r.lastBaseFee*r.gasPriceDiff/gasPriceDiffPrecision + 1
-	if baseFee >= r.minGasPrice && (baseFee >= r.lastBaseFee+expectedBaseFeeDelta || baseFee+expectedBaseFeeDelta <= r.lastBaseFee) {
-		return true
+	expectedBaseFeeDelta := r.lastBaseFee * r.gasPriceDiff / gasPriceDiffPrecision
+	// Allowing a minimum of 0 wei if the gas price diff config is 0, this will be used to let the gas oracle send transactions continuously.
+	if r.gasPriceDiff > 0 {
+		expectedBaseFeeDelta += 1
 	}
-
-	// Omitting blob base fee checks before Curie.
-	if !isCurie {
-		return false
-	}
-
-	// Right after enabling Curie.
-	if r.lastBlobBaseFee == 0 {
+	if baseFee >= r.minGasPrice && math.Abs(float64(baseFee)-float64(r.lastBaseFee)) >= float64(expectedBaseFeeDelta) {
 		return true
 	}
 
 	expectedBlobBaseFeeDelta := r.lastBlobBaseFee * r.gasPriceDiff / gasPriceDiffPrecision
 	// Plus a minimum of 0.01 gwei, since the blob base fee is usually low, preventing short-time flunctuation.
 	expectedBlobBaseFeeDelta += 10000000
-	if blobBaseFee >= r.minGasPrice && (blobBaseFee >= r.lastBlobBaseFee+expectedBlobBaseFeeDelta || blobBaseFee+expectedBlobBaseFeeDelta <= r.lastBlobBaseFee) {
+	if blobBaseFee >= r.minGasPrice && math.Abs(float64(blobBaseFee)-float64(r.lastBlobBaseFee)) >= float64(expectedBlobBaseFeeDelta) {
 		return true
 	}
 
@@ -296,5 +295,7 @@ func (r *Layer1Relayer) commitBatchReachTimeout() (bool, error) {
 	}
 	// len(batches) == 0 probably shouldn't ever happen, but need to check this
 	// Also, we should check if it's a genesis batch. If so, skip the timeout check.
-	return len(batches) == 0 || (batches[0].Index != 0 && utils.NowUTC().Sub(*batches[0].CommittedAt) > time.Duration(r.cfg.GasOracleConfig.CheckCommittedBatchesWindowMinutes)*time.Minute), nil
+	// If finalizing/finalized status is updated before committed status, skip the timeout check of this round.
+	// Because batches[0].CommittedAt is nil in this case, this will only continue for a short time window.
+	return len(batches) == 0 || (batches[0].Index != 0 && batches[0].CommittedAt != nil && utils.NowUTC().Sub(*batches[0].CommittedAt) > time.Duration(r.cfg.GasOracleConfig.CheckCommittedBatchesWindowMinutes)*time.Minute), nil
 }

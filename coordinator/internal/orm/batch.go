@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/scroll-tech/da-codec/encoding"
-	"github.com/scroll-tech/da-codec/encoding/codecv0"
 	"github.com/scroll-tech/go-ethereum/log"
 	"gorm.io/gorm"
 
@@ -20,20 +19,23 @@ type Batch struct {
 	db *gorm.DB `gorm:"column:-"`
 
 	// batch
-	Index           uint64 `json:"index" gorm:"column:index"`
-	Hash            string `json:"hash" gorm:"column:hash"`
-	DataHash        string `json:"data_hash" gorm:"column:data_hash"`
-	StartChunkIndex uint64 `json:"start_chunk_index" gorm:"column:start_chunk_index"`
-	StartChunkHash  string `json:"start_chunk_hash" gorm:"column:start_chunk_hash"`
-	EndChunkIndex   uint64 `json:"end_chunk_index" gorm:"column:end_chunk_index"`
-	EndChunkHash    string `json:"end_chunk_hash" gorm:"column:end_chunk_hash"`
-	StateRoot       string `json:"state_root" gorm:"column:state_root"`
-	WithdrawRoot    string `json:"withdraw_root" gorm:"column:withdraw_root"`
-	ParentBatchHash string `json:"parent_batch_hash" gorm:"column:parent_batch_hash"`
-	BatchHeader     []byte `json:"batch_header" gorm:"column:batch_header"`
-	CodecVersion    int16  `json:"codec_version" gorm:"column:codec_version"`
-	EnableCompress  bool   `json:"enable_compress" gorm:"column:enable_compress"`
-	BlobBytes       []byte `json:"blob_bytes" gorm:"column:blob_bytes"`
+	Index                  uint64 `json:"index" gorm:"column:index"`
+	Hash                   string `json:"hash" gorm:"column:hash"`
+	DataHash               string `json:"data_hash" gorm:"column:data_hash"`
+	StartChunkIndex        uint64 `json:"start_chunk_index" gorm:"column:start_chunk_index"`
+	StartChunkHash         string `json:"start_chunk_hash" gorm:"column:start_chunk_hash"`
+	EndChunkIndex          uint64 `json:"end_chunk_index" gorm:"column:end_chunk_index"`
+	EndChunkHash           string `json:"end_chunk_hash" gorm:"column:end_chunk_hash"`
+	StateRoot              string `json:"state_root" gorm:"column:state_root"`
+	WithdrawRoot           string `json:"withdraw_root" gorm:"column:withdraw_root"`
+	ParentBatchHash        string `json:"parent_batch_hash" gorm:"column:parent_batch_hash"`
+	BatchHeader            []byte `json:"batch_header" gorm:"column:batch_header"`
+	CodecVersion           int16  `json:"codec_version" gorm:"column:codec_version"`
+	PrevL1MessageQueueHash string `json:"prev_l1_message_queue_hash" gorm:"column:prev_l1_message_queue_hash"`
+	PostL1MessageQueueHash string `json:"post_l1_message_queue_hash" gorm:"column:post_l1_message_queue_hash"`
+	EnableCompress         bool   `json:"enable_compress" gorm:"column:enable_compress"`
+	BlobBytes              []byte `json:"blob_bytes" gorm:"column:blob_bytes"`
+	ChallengeDigest        string `json:"challenge_digest" gorm:"column:challenge_digest"`
 
 	// proof
 	ChunkProofsStatus int16      `json:"chunk_proofs_status" gorm:"column:chunk_proofs_status;default:1"`
@@ -84,7 +86,7 @@ func (*Batch) TableName() string {
 func (o *Batch) GetUnassignedBatch(ctx context.Context, maxActiveAttempts, maxTotalAttempts uint8) (*Batch, error) {
 	var batch Batch
 	db := o.db.WithContext(ctx)
-	sql := fmt.Sprintf("SELECT * FROM batch WHERE proving_status = %d AND total_attempts < %d AND active_attempts < %d AND chunk_proofs_status = %d AND batch.deleted_at IS NULL ORDER BY batch.index LIMIT 1;",
+	sql := fmt.Sprintf("SELECT * FROM batch WHERE proving_status = %d AND total_attempts < %d AND active_attempts < %d AND chunk_proofs_status = %d AND codec_version != 5 AND batch.deleted_at IS NULL ORDER BY batch.index LIMIT 1;",
 		int(types.ProvingTaskUnassigned), maxTotalAttempts, maxActiveAttempts, int(types.ChunkProofsStatusReady))
 	err := db.Raw(sql).Scan(&batch).Error
 	if err != nil {
@@ -94,6 +96,23 @@ func (o *Batch) GetUnassignedBatch(ctx context.Context, maxActiveAttempts, maxTo
 		return nil, nil
 	}
 	return &batch, nil
+}
+
+// GetUnassignedBatchCount retrieves unassigned batch count.
+func (o *Batch) GetUnassignedBatchCount(ctx context.Context, maxActiveAttempts, maxTotalAttempts uint8) (int64, error) {
+	var count int64
+	db := o.db.WithContext(ctx)
+	db = db.Model(&Batch{})
+	db = db.Where("proving_status = ?", int(types.ProvingTaskUnassigned))
+	db = db.Where("total_attempts < ?", maxTotalAttempts)
+	db = db.Where("active_attempts < ?", maxActiveAttempts)
+	db = db.Where("chunk_proofs_status = ?", int(types.ChunkProofsStatusReady))
+	db = db.Where("codec_version != 5")
+	db = db.Where("batch.deleted_at IS NULL")
+	if err := db.Count(&count).Error; err != nil {
+		return 0, fmt.Errorf("Batch.GetUnassignedBatchCount error: %w", err)
+	}
+	return count, nil
 }
 
 // GetAssignedBatch retrieves assigned batch based on the specified limit.
@@ -252,11 +271,16 @@ func (o *Batch) InsertBatch(ctx context.Context, batch *encoding.Batch, dbTX ...
 		return nil, errors.New("invalid args: batch contains 0 chunk")
 	}
 
-	daBatch, err := codecv0.NewDABatch(batch)
+	codec, err := encoding.CodecFromVersion(encoding.CodecV0)
+	if err != nil {
+		return nil, fmt.Errorf("Batch.InsertBatch error: %w", err)
+	}
+
+	daBatch, err := codec.NewDABatch(batch)
 	if err != nil {
 		log.Error("failed to create new DA batch",
 			"index", batch.Index, "total l1 message popped before", batch.TotalL1MessagePoppedBefore,
-			"parent hash", batch.ParentBatchHash, "number of chunks", numChunks, "err", err)
+			"parent hash", batch.ParentBatchHash.Hex(), "number of chunks", numChunks, "err", err)
 		return nil, err
 	}
 
@@ -264,7 +288,7 @@ func (o *Batch) InsertBatch(ctx context.Context, batch *encoding.Batch, dbTX ...
 	parentBatch, err := o.GetLatestBatch(ctx)
 	if err != nil {
 		log.Error("failed to get latest batch", "index", batch.Index, "total l1 message popped before", batch.TotalL1MessagePoppedBefore,
-			"parent hash", batch.ParentBatchHash, "number of chunks", numChunks, "err", err)
+			"parent hash", batch.ParentBatchHash.Hex(), "number of chunks", numChunks, "err", err)
 		return nil, fmt.Errorf("Batch.InsertBatch error: %w", err)
 	}
 
@@ -275,17 +299,17 @@ func (o *Batch) InsertBatch(ctx context.Context, batch *encoding.Batch, dbTX ...
 		startChunkIndex = parentBatch.EndChunkIndex + 1
 	}
 
-	startDAChunk, err := codecv0.NewDAChunk(batch.Chunks[0], batch.TotalL1MessagePoppedBefore)
+	startDAChunk, err := codec.NewDAChunk(batch.Chunks[0], batch.TotalL1MessagePoppedBefore)
 	if err != nil {
 		log.Error("failed to create start DA chunk", "index", batch.Index, "total l1 message popped before", batch.TotalL1MessagePoppedBefore,
-			"parent hash", batch.ParentBatchHash, "number of chunks", numChunks, "err", err)
+			"parent hash", batch.ParentBatchHash.Hex(), "number of chunks", numChunks, "err", err)
 		return nil, fmt.Errorf("Batch.InsertBatch error: %w", err)
 	}
 
 	startDAChunkHash, err := startDAChunk.Hash()
 	if err != nil {
 		log.Error("failed to get start DA chunk hash", "index", batch.Index, "total l1 message popped before", batch.TotalL1MessagePoppedBefore,
-			"parent hash", batch.ParentBatchHash, "number of chunks", numChunks, "err", err)
+			"parent hash", batch.ParentBatchHash.Hex(), "number of chunks", numChunks, "err", err)
 		return nil, fmt.Errorf("Batch.InsertBatch error: %w", err)
 	}
 
@@ -293,24 +317,24 @@ func (o *Batch) InsertBatch(ctx context.Context, batch *encoding.Batch, dbTX ...
 	for i := uint64(0); i < numChunks-1; i++ {
 		totalL1MessagePoppedBeforeEndDAChunk += batch.Chunks[i].NumL1Messages(totalL1MessagePoppedBeforeEndDAChunk)
 	}
-	endDAChunk, err := codecv0.NewDAChunk(batch.Chunks[numChunks-1], totalL1MessagePoppedBeforeEndDAChunk)
+	endDAChunk, err := codec.NewDAChunk(batch.Chunks[numChunks-1], totalL1MessagePoppedBeforeEndDAChunk)
 	if err != nil {
 		log.Error("failed to create end DA chunk", "index", batch.Index, "total l1 message popped before", totalL1MessagePoppedBeforeEndDAChunk,
-			"parent hash", batch.ParentBatchHash, "number of chunks", numChunks, "err", err)
+			"parent hash", batch.ParentBatchHash.Hex(), "number of chunks", numChunks, "err", err)
 		return nil, fmt.Errorf("Batch.InsertBatch error: %w", err)
 	}
 
 	endDAChunkHash, err := endDAChunk.Hash()
 	if err != nil {
 		log.Error("failed to get end DA chunk hash", "index", batch.Index, "total l1 message popped before", totalL1MessagePoppedBeforeEndDAChunk,
-			"parent hash", batch.ParentBatchHash, "number of chunks", numChunks, "err", err)
+			"parent hash", batch.ParentBatchHash.Hex(), "number of chunks", numChunks, "err", err)
 		return nil, fmt.Errorf("Batch.InsertBatch error: %w", err)
 	}
 
 	newBatch := Batch{
 		Index:             batch.Index,
 		Hash:              daBatch.Hash().Hex(),
-		DataHash:          daBatch.DataHash.Hex(),
+		DataHash:          daBatch.DataHash().Hex(),
 		StartChunkHash:    startDAChunkHash.Hex(),
 		StartChunkIndex:   startChunkIndex,
 		EndChunkHash:      endDAChunkHash.Hex(),

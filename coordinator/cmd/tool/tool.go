@@ -19,6 +19,7 @@ import (
 )
 
 var app *cli.App
+var cfg *config.Config
 
 func init() {
 	// Set up coordinator app info.
@@ -29,16 +30,29 @@ func init() {
 	app.Version = version.Version
 	app.Flags = append(app.Flags, utils.CommonFlags...)
 	app.Before = func(ctx *cli.Context) error {
-		return utils.LogSetup(ctx)
+		if err := utils.LogSetup(ctx); err != nil {
+			return err
+		}
+
+		cfgFile := ctx.String(utils.ConfigFileFlag.Name)
+		var err error
+		cfg, err = config.NewConfig(cfgFile)
+		if err != nil {
+			log.Crit("failed to load config file", "config file", cfgFile, "error", err)
+		}
+		return nil
+	}
+	// sub commands
+	app.Commands = []*cli.Command{
+		{
+			Name:   "verify",
+			Usage:  "verify an proof, specified by [forkname] <type> <proof path>",
+			Action: verify,
+		},
 	}
 }
 
 func action(ctx *cli.Context) error {
-	cfgFile := ctx.String(utils.ConfigFileFlag.Name)
-	cfg, err := config.NewConfig(cfgFile)
-	if err != nil {
-		log.Crit("failed to load config file", "config file", cfgFile, "error", err)
-	}
 	db, err := database.InitDB(cfg.DB)
 	if err != nil {
 		log.Crit("failed to init db connection", "err", err)
@@ -62,9 +76,9 @@ func action(ctx *cli.Context) error {
 		return fmt.Errorf("failed to get batch proofs for bundle task id:%s, no batch found", taskID)
 	}
 
-	var batchProofs []*message.BatchProof
+	var batchProofs []*message.OpenVMBatchProof
 	for _, batch := range batches {
-		var proof message.BatchProof
+		var proof message.OpenVMBatchProof
 		if encodeErr := json.Unmarshal(batch.Proof, &proof); encodeErr != nil {
 			log.Error("failed to unmarshal batch proof")
 			return fmt.Errorf("failed to unmarshal proof: %w, bundle hash: %v, batch hash: %v", encodeErr, taskID, batch.Hash)

@@ -8,19 +8,16 @@ import (
 	"testing"
 
 	"github.com/scroll-tech/da-codec/encoding"
-	"github.com/scroll-tech/da-codec/encoding/codecv0"
-	"github.com/scroll-tech/da-codec/encoding/codecv1"
-	"github.com/scroll-tech/da-codec/encoding/codecv2"
-	"github.com/scroll-tech/da-codec/encoding/codecv3"
 	"github.com/scroll-tech/go-ethereum/common"
 	gethTypes "github.com/scroll-tech/go-ethereum/core/types"
 	"github.com/stretchr/testify/assert"
 	"gorm.io/gorm"
 
+	"scroll-tech/database/migrate"
+
 	"scroll-tech/common/testcontainers"
 	"scroll-tech/common/types"
 	"scroll-tech/common/types/message"
-	"scroll-tech/database/migrate"
 
 	"scroll-tech/rollup/internal/utils"
 )
@@ -74,12 +71,14 @@ func setupEnv(t *testing.T) {
 	block1 = &encoding.Block{}
 	err = json.Unmarshal(templateBlockTrace, block1)
 	assert.NoError(t, err)
+	block1.RowConsumption = nil
 
 	templateBlockTrace, err = os.ReadFile("../../../common/testdata/blockTrace_03.json")
 	assert.NoError(t, err)
 	block2 = &encoding.Block{}
 	err = json.Unmarshal(templateBlockTrace, block2)
 	assert.NoError(t, err)
+	block2.RowConsumption = nil
 }
 
 func tearDownEnv(t *testing.T) {
@@ -170,7 +169,7 @@ func TestL2BlockOrm(t *testing.T) {
 }
 
 func TestChunkOrm(t *testing.T) {
-	codecVersions := []encoding.CodecVersion{encoding.CodecV0, encoding.CodecV1, encoding.CodecV2, encoding.CodecV3}
+	codecVersions := []encoding.CodecVersion{encoding.CodecV0, encoding.CodecV1, encoding.CodecV2, encoding.CodecV3, encoding.CodecV4}
 	chunk1 := &encoding.Chunk{Blocks: []*encoding.Block{block1}}
 	chunk2 := &encoding.Chunk{Blocks: []*encoding.Block{block2}}
 	for _, codecVersion := range codecVersions {
@@ -179,53 +178,23 @@ func TestChunkOrm(t *testing.T) {
 		assert.NoError(t, migrate.ResetDB(sqlDB))
 		var chunkHash1 common.Hash
 		var chunkHash2 common.Hash
-		if codecVersion == encoding.CodecV0 {
-			daChunk1, createErr := codecv0.NewDAChunk(chunk1, 0)
-			assert.NoError(t, createErr)
-			chunkHash1, err = daChunk1.Hash()
-			assert.NoError(t, err)
+		codec, err := encoding.CodecFromVersion(codecVersion)
+		assert.NoError(t, err)
+		daChunk1, createErr := codec.NewDAChunk(chunk1, 0)
+		assert.NoError(t, createErr)
+		chunkHash1, err = daChunk1.Hash()
+		assert.NoError(t, err)
 
-			daChunk2, createErr := codecv0.NewDAChunk(chunk2, chunk1.NumL1Messages(0))
-			assert.NoError(t, createErr)
-			chunkHash2, err = daChunk2.Hash()
-			assert.NoError(t, err)
-		} else if codecVersion == encoding.CodecV1 {
-			daChunk1, createErr := codecv1.NewDAChunk(chunk1, 0)
-			assert.NoError(t, createErr)
-			chunkHash1, err = daChunk1.Hash()
-			assert.NoError(t, err)
+		daChunk2, createErr := codec.NewDAChunk(chunk2, chunk1.NumL1Messages(0))
+		assert.NoError(t, createErr)
+		chunkHash2, err = daChunk2.Hash()
+		assert.NoError(t, err)
 
-			daChunk2, createErr := codecv1.NewDAChunk(chunk2, chunk1.NumL1Messages(0))
-			assert.NoError(t, createErr)
-			chunkHash2, err = daChunk2.Hash()
-			assert.NoError(t, err)
-		} else if codecVersion == encoding.CodecV2 {
-			daChunk1, createErr := codecv2.NewDAChunk(chunk1, 0)
-			assert.NoError(t, createErr)
-			chunkHash1, err = daChunk1.Hash()
-			assert.NoError(t, err)
-
-			daChunk2, createErr := codecv2.NewDAChunk(chunk2, chunk1.NumL1Messages(0))
-			assert.NoError(t, createErr)
-			chunkHash2, err = daChunk2.Hash()
-			assert.NoError(t, err)
-		} else {
-			daChunk1, createErr := codecv3.NewDAChunk(chunk1, 0)
-			assert.NoError(t, createErr)
-			chunkHash1, err = daChunk1.Hash()
-			assert.NoError(t, err)
-
-			daChunk2, createErr := codecv3.NewDAChunk(chunk2, chunk1.NumL1Messages(0))
-			assert.NoError(t, createErr)
-			chunkHash2, err = daChunk2.Hash()
-			assert.NoError(t, err)
-		}
-
-		dbChunk1, err := chunkOrm.InsertChunk(context.Background(), chunk1, utils.CodecConfig{Version: codecVersion}, utils.ChunkMetrics{})
+		dbChunk1, err := chunkOrm.InsertChunk(context.Background(), chunk1, codecVersion, utils.ChunkMetrics{})
 		assert.NoError(t, err)
 		assert.Equal(t, dbChunk1.Hash, chunkHash1.Hex())
 
-		dbChunk2, err := chunkOrm.InsertChunk(context.Background(), chunk2, utils.CodecConfig{Version: codecVersion}, utils.ChunkMetrics{})
+		dbChunk2, err := chunkOrm.InsertChunk(context.Background(), chunk2, codecVersion, utils.ChunkMetrics{})
 		assert.NoError(t, err)
 		assert.Equal(t, dbChunk2.Hash, chunkHash2.Hex())
 
@@ -263,7 +232,7 @@ func TestChunkOrm(t *testing.T) {
 }
 
 func TestBatchOrm(t *testing.T) {
-	codecVersions := []encoding.CodecVersion{encoding.CodecV0, encoding.CodecV1, encoding.CodecV2, encoding.CodecV3}
+	codecVersions := []encoding.CodecVersion{encoding.CodecV0, encoding.CodecV1, encoding.CodecV2, encoding.CodecV3, encoding.CodecV4}
 	chunk1 := &encoding.Chunk{Blocks: []*encoding.Block{block1}}
 	chunk2 := &encoding.Chunk{Blocks: []*encoding.Block{block2}}
 	for _, codecVersion := range codecVersions {
@@ -275,54 +244,34 @@ func TestBatchOrm(t *testing.T) {
 			Index:  0,
 			Chunks: []*encoding.Chunk{chunk1},
 		}
-		batch1, err := batchOrm.InsertBatch(context.Background(), batch, utils.CodecConfig{Version: codecVersion}, utils.BatchMetrics{})
+		batch1, err := batchOrm.InsertBatch(context.Background(), batch, codecVersion, utils.BatchMetrics{})
 		assert.NoError(t, err)
 		hash1 := batch1.Hash
 
 		batch1, err = batchOrm.GetBatchByIndex(context.Background(), 0)
 		assert.NoError(t, err)
 
-		var batchHash1 string
-		if codecVersion == encoding.CodecV0 {
-			daBatch1, createErr := codecv0.NewDABatchFromBytes(batch1.BatchHeader)
-			assert.NoError(t, createErr)
-			batchHash1 = daBatch1.Hash().Hex()
-		} else if codecVersion == encoding.CodecV1 {
-			daBatch1, createErr := codecv1.NewDABatchFromBytes(batch1.BatchHeader)
-			assert.NoError(t, createErr)
-			batchHash1 = daBatch1.Hash().Hex()
-		} else if codecVersion == encoding.CodecV2 {
-			daBatch1, createErr := codecv2.NewDABatchFromBytes(batch1.BatchHeader)
-			assert.NoError(t, createErr)
-			batchHash1 = daBatch1.Hash().Hex()
-		} else {
-			daBatch1, createErr := codecv3.NewDABatchFromBytes(batch1.BatchHeader)
-			assert.NoError(t, createErr)
-			batchHash1 = daBatch1.Hash().Hex()
-		}
+		codec, err := encoding.CodecFromVersion(codecVersion)
+		assert.NoError(t, err)
+		daBatch1, createErr := codec.NewDABatchFromBytes(batch1.BatchHeader)
+		assert.NoError(t, createErr)
+		batchHash1 := daBatch1.Hash().Hex()
 		assert.Equal(t, hash1, batchHash1)
 
 		batch = &encoding.Batch{
 			Index:  1,
 			Chunks: []*encoding.Chunk{chunk2},
 		}
-		batch2, err := batchOrm.InsertBatch(context.Background(), batch, utils.CodecConfig{Version: codecVersion}, utils.BatchMetrics{})
+		batch2, err := batchOrm.InsertBatch(context.Background(), batch, codecVersion, utils.BatchMetrics{})
 		assert.NoError(t, err)
 		hash2 := batch2.Hash
 
 		batch2, err = batchOrm.GetBatchByIndex(context.Background(), 1)
 		assert.NoError(t, err)
 
-		var batchHash2 string
-		if codecVersion == encoding.CodecV0 {
-			daBatch2, createErr := codecv0.NewDABatchFromBytes(batch2.BatchHeader)
-			assert.NoError(t, createErr)
-			batchHash2 = daBatch2.Hash().Hex()
-		} else {
-			daBatch2, createErr := codecv1.NewDABatchFromBytes(batch2.BatchHeader)
-			assert.NoError(t, createErr)
-			batchHash2 = daBatch2.Hash().Hex()
-		}
+		daBatch2, createErr := codec.NewDABatchFromBytes(batch2.BatchHeader)
+		assert.NoError(t, createErr)
+		batchHash2 := daBatch2.Hash().Hex()
 		assert.Equal(t, hash2, batchHash2)
 
 		count, err := batchOrm.GetBatchCount(context.Background())
@@ -353,24 +302,22 @@ func TestBatchOrm(t *testing.T) {
 		assert.NoError(t, err)
 		err = batchOrm.UpdateRollupStatus(context.Background(), batchHash2, types.RollupFinalized)
 		assert.NoError(t, err)
-		err = batchOrm.UpdateL2GasOracleStatusAndOracleTxHash(context.Background(), batchHash2, types.GasOracleImported, "oracleTxHash")
-		assert.NoError(t, err)
 
 		updatedBatch, err := batchOrm.GetLatestBatch(context.Background())
 		assert.NoError(t, err)
 		assert.NotNil(t, updatedBatch)
 		assert.Equal(t, types.ProvingTaskVerified, types.ProvingStatus(updatedBatch.ProvingStatus))
 		assert.Equal(t, types.RollupFinalized, types.RollupStatus(updatedBatch.RollupStatus))
-		assert.Equal(t, types.GasOracleImported, types.GasOracleStatus(updatedBatch.OracleStatus))
-		assert.Equal(t, "oracleTxHash", updatedBatch.OracleTxHash)
 
+		err = batchOrm.UpdateCommitTxHashAndRollupStatus(context.Background(), batchHash1, "commitTxHash", types.RollupCommitted)
+		assert.NoError(t, err)
 		err = batchOrm.UpdateCommitTxHashAndRollupStatus(context.Background(), batchHash2, "commitTxHash", types.RollupCommitted)
 		assert.NoError(t, err)
 		updatedBatch, err = batchOrm.GetLatestBatch(context.Background())
 		assert.NoError(t, err)
 		assert.NotNil(t, updatedBatch)
 		assert.Equal(t, "commitTxHash", updatedBatch.CommitTxHash)
-		assert.Equal(t, types.RollupCommitted, types.RollupStatus(updatedBatch.RollupStatus))
+		assert.Equal(t, types.RollupFinalized, types.RollupStatus(updatedBatch.RollupStatus))
 
 		err = batchOrm.UpdateFinalizeTxHashAndRollupStatus(context.Background(), batchHash2, "finalizeTxHash", types.RollupFinalizeFailed)
 		assert.NoError(t, err)
@@ -381,23 +328,21 @@ func TestBatchOrm(t *testing.T) {
 		assert.Equal(t, "finalizeTxHash", updatedBatch.FinalizeTxHash)
 		assert.Equal(t, types.RollupFinalizeFailed, types.RollupStatus(updatedBatch.RollupStatus))
 
-		batches, err := batchOrm.GetBatchesGEIndexGECodecVersion(context.Background(), 0, codecVersion, 0)
-		assert.NoError(t, err)
-		assert.Equal(t, 2, len(batches))
-		assert.Equal(t, batchHash1, batches[0].Hash)
-		assert.Equal(t, batchHash2, batches[1].Hash)
-
-		batches, err = batchOrm.GetBatchesGEIndexGECodecVersion(context.Background(), 0, codecVersion, 1)
+		batches, err := batchOrm.GetCommittedBatchesGEIndexGECodecVersion(context.Background(), 0, codecVersion, 0)
 		assert.NoError(t, err)
 		assert.Equal(t, 1, len(batches))
 		assert.Equal(t, batchHash1, batches[0].Hash)
 
-		batches, err = batchOrm.GetBatchesGEIndexGECodecVersion(context.Background(), 1, codecVersion, 0)
+		batches, err = batchOrm.GetCommittedBatchesGEIndexGECodecVersion(context.Background(), 0, codecVersion, 1)
 		assert.NoError(t, err)
 		assert.Equal(t, 1, len(batches))
-		assert.Equal(t, batchHash2, batches[0].Hash)
+		assert.Equal(t, batchHash1, batches[0].Hash)
 
-		batches, err = batchOrm.GetBatchesGEIndexGECodecVersion(context.Background(), 0, codecVersion+1, 0)
+		batches, err = batchOrm.GetCommittedBatchesGEIndexGECodecVersion(context.Background(), 1, codecVersion, 0)
+		assert.NoError(t, err)
+		assert.Equal(t, 0, len(batches))
+
+		batches, err = batchOrm.GetCommittedBatchesGEIndexGECodecVersion(context.Background(), 0, codecVersion+1, 0)
 		assert.NoError(t, err)
 		assert.Equal(t, 0, len(batches))
 
@@ -410,15 +355,9 @@ func TestBatchOrm(t *testing.T) {
 		err = batchOrm.UpdateFinalizeTxHashAndRollupStatusByBundleHash(context.Background(), "test hash", "tx hash", types.RollupCommitFailed)
 		assert.NoError(t, err)
 
-		batches, err = batchOrm.GetBatchesGEIndexGECodecVersion(context.Background(), 0, codecVersion, 0)
+		batches, err = batchOrm.GetCommittedBatchesGEIndexGECodecVersion(context.Background(), 0, codecVersion, 0)
 		assert.NoError(t, err)
-		assert.Equal(t, 2, len(batches))
-		assert.Equal(t, batchHash1, batches[0].Hash)
-		assert.Equal(t, batchHash2, batches[1].Hash)
-		assert.Equal(t, types.ProvingTaskFailed, types.ProvingStatus(batches[0].ProvingStatus))
-		assert.Equal(t, types.RollupCommitFailed, types.RollupStatus(batches[0].RollupStatus))
-		assert.Equal(t, types.ProvingTaskVerified, types.ProvingStatus(batches[1].ProvingStatus))
-		assert.Equal(t, types.RollupFinalizeFailed, types.RollupStatus(batches[1].RollupStatus))
+		assert.Equal(t, 0, len(batches))
 	}
 }
 
@@ -432,7 +371,7 @@ func TestBundleOrm(t *testing.T) {
 		Index:  0,
 		Chunks: []*encoding.Chunk{chunk1},
 	}
-	dbBatch1, err := batchOrm.InsertBatch(context.Background(), batch1, utils.CodecConfig{Version: encoding.CodecV3}, utils.BatchMetrics{})
+	dbBatch1, err := batchOrm.InsertBatch(context.Background(), batch1, encoding.CodecV4, utils.BatchMetrics{})
 	assert.NoError(t, err)
 
 	chunk2 := &encoding.Chunk{Blocks: []*encoding.Block{block2}}
@@ -440,30 +379,30 @@ func TestBundleOrm(t *testing.T) {
 		Index:  1,
 		Chunks: []*encoding.Chunk{chunk2},
 	}
-	dbBatch2, err := batchOrm.InsertBatch(context.Background(), batch2, utils.CodecConfig{Version: encoding.CodecV3}, utils.BatchMetrics{})
+	dbBatch2, err := batchOrm.InsertBatch(context.Background(), batch2, encoding.CodecV4, utils.BatchMetrics{})
 	assert.NoError(t, err)
 
 	var bundle1 *Bundle
 	var bundle2 *Bundle
 
 	t.Run("InsertBundle", func(t *testing.T) {
-		bundle1, err = bundleOrm.InsertBundle(context.Background(), []*Batch{dbBatch1}, encoding.CodecV3)
+		bundle1, err = bundleOrm.InsertBundle(context.Background(), []*Batch{dbBatch1}, encoding.CodecV4)
 		assert.NoError(t, err)
 		assert.NotNil(t, bundle1)
 		assert.Equal(t, uint64(0), bundle1.StartBatchIndex)
 		assert.Equal(t, uint64(0), bundle1.EndBatchIndex)
 		assert.Equal(t, dbBatch1.Hash, bundle1.StartBatchHash)
 		assert.Equal(t, dbBatch1.Hash, bundle1.EndBatchHash)
-		assert.Equal(t, encoding.CodecV3, encoding.CodecVersion(bundle1.CodecVersion))
+		assert.Equal(t, encoding.CodecV4, encoding.CodecVersion(bundle1.CodecVersion))
 
-		bundle2, err = bundleOrm.InsertBundle(context.Background(), []*Batch{dbBatch2}, encoding.CodecV3)
+		bundle2, err = bundleOrm.InsertBundle(context.Background(), []*Batch{dbBatch2}, encoding.CodecV4)
 		assert.NoError(t, err)
 		assert.NotNil(t, bundle2)
 		assert.Equal(t, uint64(1), bundle2.StartBatchIndex)
 		assert.Equal(t, uint64(1), bundle2.EndBatchIndex)
 		assert.Equal(t, dbBatch2.Hash, bundle2.StartBatchHash)
 		assert.Equal(t, dbBatch2.Hash, bundle2.EndBatchHash)
-		assert.Equal(t, encoding.CodecV3, encoding.CodecVersion(bundle2.CodecVersion))
+		assert.Equal(t, encoding.CodecV4, encoding.CodecVersion(bundle2.CodecVersion))
 	})
 
 	t.Run("GetFirstUnbundledBatchIndex", func(t *testing.T) {
@@ -514,9 +453,7 @@ func TestBundleOrm(t *testing.T) {
 	})
 
 	t.Run("GetVerifiedProofByHash", func(t *testing.T) {
-		proof := &message.BundleProof{
-			Proof: []byte("test proof"),
-		}
+		proof := &message.OpenVMBundleProof{EvmProof: &message.OpenVMEvmProof{Instances: make([]byte, 384)}}
 		proofBytes, err := json.Marshal(proof)
 		assert.NoError(t, err)
 
@@ -525,7 +462,7 @@ func TestBundleOrm(t *testing.T) {
 
 		retrievedProof, err := bundleOrm.GetVerifiedProofByHash(context.Background(), bundle1.Hash)
 		assert.NoError(t, err)
-		assert.Equal(t, proof.Proof, retrievedProof.Proof)
+		assert.Equal(t, proof.Proof(), retrievedProof.Proof())
 	})
 
 	t.Run("GetBundles", func(t *testing.T) {
@@ -537,9 +474,7 @@ func TestBundleOrm(t *testing.T) {
 	})
 
 	t.Run("UpdateProofAndProvingStatusByHash", func(t *testing.T) {
-		proof := &message.BundleProof{
-			Proof: []byte("new test proof"),
-		}
+		proof := &message.OpenVMBundleProof{EvmProof: &message.OpenVMEvmProof{Instances: make([]byte, 384)}}
 		err := bundleOrm.UpdateProofAndProvingStatusByHash(context.Background(), bundle2.Hash, proof, types.ProvingTaskVerified, 600)
 		assert.NoError(t, err)
 
@@ -550,10 +485,10 @@ func TestBundleOrm(t *testing.T) {
 		assert.Equal(t, int32(600), bundle.ProofTimeSec)
 		assert.NotNil(t, bundle.ProvedAt)
 
-		var retrievedProof message.BundleProof
+		retrievedProof := &message.OpenVMBundleProof{}
 		err = json.Unmarshal(bundle.Proof, &retrievedProof)
 		assert.NoError(t, err)
-		assert.Equal(t, proof.Proof, retrievedProof.Proof)
+		assert.Equal(t, proof.Proof(), retrievedProof.Proof())
 	})
 
 	t.Run("UpdateRollupStatus", func(t *testing.T) {
@@ -614,7 +549,7 @@ func TestPendingTransactionOrm(t *testing.T) {
 	err = pendingTransactionOrm.InsertPendingTransaction(context.Background(), "test", senderMeta, tx1, 0)
 	assert.NoError(t, err)
 
-	err = pendingTransactionOrm.UpdatePendingTransactionStatusByTxHash(context.Background(), tx0.Hash(), types.TxStatusReplaced)
+	err = pendingTransactionOrm.UpdateTransactionStatusByTxHash(context.Background(), tx0.Hash(), types.TxStatusReplaced)
 	assert.NoError(t, err)
 
 	txs, err := pendingTransactionOrm.GetPendingOrReplacedTransactionsBySenderType(context.Background(), senderMeta.Type, 2)
@@ -631,7 +566,7 @@ func TestPendingTransactionOrm(t *testing.T) {
 	assert.Equal(t, senderMeta.Address.String(), txs[1].SenderAddress)
 	assert.Equal(t, senderMeta.Type, txs[1].SenderType)
 
-	err = pendingTransactionOrm.UpdatePendingTransactionStatusByTxHash(context.Background(), tx1.Hash(), types.TxStatusConfirmed)
+	err = pendingTransactionOrm.UpdateTransactionStatusByTxHash(context.Background(), tx1.Hash(), types.TxStatusConfirmed)
 	assert.NoError(t, err)
 
 	txs, err = pendingTransactionOrm.GetPendingOrReplacedTransactionsBySenderType(context.Background(), senderMeta.Type, 2)
@@ -648,4 +583,75 @@ func TestPendingTransactionOrm(t *testing.T) {
 	status, err := pendingTransactionOrm.GetTxStatusByTxHash(context.Background(), tx0.Hash())
 	assert.NoError(t, err)
 	assert.Equal(t, types.TxStatusConfirmedFailed, status)
+
+	// Test DeleteTransactionByTxHash
+	err = pendingTransactionOrm.DeleteTransactionByTxHash(context.Background(), tx0.Hash())
+	assert.NoError(t, err)
+
+	// Verify the transaction is deleted
+	status, err = pendingTransactionOrm.GetTxStatusByTxHash(context.Background(), tx0.Hash())
+	assert.NoError(t, err)
+	assert.Equal(t, types.TxStatusUnknown, status) // Should return unknown status for deleted transaction
+
+	// Try to delete non-existent transaction
+	err = pendingTransactionOrm.DeleteTransactionByTxHash(context.Background(), common.HexToHash("0x123"))
+	assert.Error(t, err) // Should return error for non-existent transaction
+}
+
+func TestPendingTransaction_GetMaxNonceBySenderAddress(t *testing.T) {
+	sqlDB, err := db.DB()
+	assert.NoError(t, err)
+	assert.NoError(t, migrate.ResetDB(sqlDB))
+
+	// When there are no transactions for this sender address, should return -1
+	maxNonce, err := pendingTransactionOrm.GetMaxNonceBySenderAddress(context.Background(), "0xdeadbeef")
+	assert.NoError(t, err)
+	assert.Equal(t, int64(-1), maxNonce)
+
+	// Insert two transactions with different nonces for the same sender address
+	senderMeta := &SenderMeta{
+		Name:    "testName",
+		Service: "testService",
+		Address: common.HexToAddress("0xdeadbeef"),
+		Type:    types.SenderTypeCommitBatch,
+	}
+
+	tx0 := gethTypes.NewTx(&gethTypes.DynamicFeeTx{
+		Nonce:      1,
+		To:         &common.Address{},
+		Data:       []byte{},
+		Gas:        21000,
+		AccessList: gethTypes.AccessList{},
+		Value:      big.NewInt(0),
+		ChainID:    big.NewInt(1),
+		GasTipCap:  big.NewInt(0),
+		GasFeeCap:  big.NewInt(1),
+		V:          big.NewInt(0),
+		R:          big.NewInt(0),
+		S:          big.NewInt(0),
+	})
+	tx1 := gethTypes.NewTx(&gethTypes.DynamicFeeTx{
+		Nonce:      3,
+		To:         &common.Address{},
+		Data:       []byte{},
+		Gas:        22000,
+		AccessList: gethTypes.AccessList{},
+		Value:      big.NewInt(0),
+		ChainID:    big.NewInt(1),
+		GasTipCap:  big.NewInt(1),
+		GasFeeCap:  big.NewInt(2),
+		V:          big.NewInt(0),
+		R:          big.NewInt(0),
+		S:          big.NewInt(0),
+	})
+
+	err = pendingTransactionOrm.InsertPendingTransaction(context.Background(), "test", senderMeta, tx0, 0)
+	assert.NoError(t, err)
+	err = pendingTransactionOrm.InsertPendingTransaction(context.Background(), "test", senderMeta, tx1, 0)
+	assert.NoError(t, err)
+
+	// Now the max nonce for this sender should be 3
+	maxNonce, err = pendingTransactionOrm.GetMaxNonceBySenderAddress(context.Background(), senderMeta.Address.String())
+	assert.NoError(t, err)
+	assert.Equal(t, int64(3), maxNonce)
 }

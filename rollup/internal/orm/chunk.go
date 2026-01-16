@@ -7,12 +7,15 @@ import (
 	"time"
 
 	"github.com/scroll-tech/da-codec/encoding"
-	"github.com/scroll-tech/go-ethereum/log"
 	"gorm.io/gorm"
 
-	"scroll-tech/common/types"
+	"github.com/scroll-tech/go-ethereum/common"
+	"github.com/scroll-tech/go-ethereum/crypto"
+	"github.com/scroll-tech/go-ethereum/log"
 
-	"scroll-tech/rollup/internal/utils"
+	"scroll-tech/common/types"
+	"scroll-tech/common/utils"
+
 	rutils "scroll-tech/rollup/internal/utils"
 )
 
@@ -30,6 +33,8 @@ type Chunk struct {
 	StartBlockTime               uint64 `json:"start_block_time" gorm:"column:start_block_time"`
 	TotalL1MessagesPoppedBefore  uint64 `json:"total_l1_messages_popped_before" gorm:"column:total_l1_messages_popped_before"`
 	TotalL1MessagesPoppedInChunk uint64 `json:"total_l1_messages_popped_in_chunk" gorm:"column:total_l1_messages_popped_in_chunk"`
+	PrevL1MessageQueueHash       string `json:"prev_l1_message_queue_hash" gorm:"column:prev_l1_message_queue_hash"`
+	PostL1MessageQueueHash       string `json:"post_l1_message_queue_hash" gorm:"column:post_l1_message_queue_hash"`
 	ParentChunkHash              string `json:"parent_chunk_hash" gorm:"column:parent_chunk_hash"`
 	StateRoot                    string `json:"state_root" gorm:"column:state_root"`
 	ParentChunkStateRoot         string `json:"parent_chunk_state_root" gorm:"column:parent_chunk_state_root"`
@@ -48,14 +53,14 @@ type Chunk struct {
 	BatchHash string `json:"batch_hash" gorm:"column:batch_hash;default:NULL"`
 
 	// blob
-	CrcMax   uint64 `json:"crc_max" gorm:"column:crc_max"`
+	CrcMax   uint64 `json:"crc_max" gorm:"column:crc_max"` // deprecated
 	BlobSize uint64 `json:"blob_size" gorm:"column:blob_size"`
 
 	// metadata
 	TotalL2TxGas              uint64         `json:"total_l2_tx_gas" gorm:"column:total_l2_tx_gas"`
 	TotalL2TxNum              uint64         `json:"total_l2_tx_num" gorm:"column:total_l2_tx_num"`
-	TotalL1CommitCalldataSize uint64         `json:"total_l1_commit_calldata_size" gorm:"column:total_l1_commit_calldata_size"`
-	TotalL1CommitGas          uint64         `json:"total_l1_commit_gas" gorm:"column:total_l1_commit_gas"`
+	TotalL1CommitCalldataSize uint64         `json:"total_l1_commit_calldata_size" gorm:"column:total_l1_commit_calldata_size"` // deprecated
+	TotalL1CommitGas          uint64         `json:"total_l1_commit_gas" gorm:"column:total_l1_commit_gas"`                     // deprecated
 	CreatedAt                 time.Time      `json:"created_at" gorm:"column:created_at"`
 	UpdatedAt                 time.Time      `json:"updated_at" gorm:"column:updated_at"`
 	DeletedAt                 gorm.DeletedAt `json:"deleted_at" gorm:"column:deleted_at;default:NULL"`
@@ -97,8 +102,8 @@ func (o *Chunk) GetChunksInRange(ctx context.Context, startIndex uint64, endInde
 	return chunks, nil
 }
 
-// getLatestChunk retrieves the latest chunk from the database.
-func (o *Chunk) getLatestChunk(ctx context.Context) (*Chunk, error) {
+// GetLatestChunk retrieves the latest chunk from the database.
+func (o *Chunk) GetLatestChunk(ctx context.Context) (*Chunk, error) {
 	db := o.db.WithContext(ctx)
 	db = db.Model(&Chunk{})
 	db = db.Order("index desc")
@@ -116,7 +121,7 @@ func (o *Chunk) getLatestChunk(ctx context.Context) (*Chunk, error) {
 // GetUnchunkedBlockHeight retrieves the first unchunked block number.
 func (o *Chunk) GetUnchunkedBlockHeight(ctx context.Context) (uint64, error) {
 	// Get the latest chunk
-	latestChunk, err := o.getLatestChunk(ctx)
+	latestChunk, err := o.GetLatestChunk(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("Chunk.GetUnchunkedBlockHeight error: %w", err)
 	}
@@ -177,8 +182,27 @@ func (o *Chunk) GetChunksByBatchHash(ctx context.Context, batchHash string) ([]*
 	return chunks, nil
 }
 
+// GetParentChunkByBlockNumber retrieves the parent chunk by block number
+// only used by proposer tool for analysis usage
+func (o *Chunk) GetParentChunkByBlockNumber(ctx context.Context, blockNumber uint64) (*Chunk, error) {
+	db := o.db.WithContext(ctx)
+	db = db.Model(&Chunk{})
+	db = db.Where("end_block_number < ?", blockNumber)
+	db = db.Order("end_block_number DESC")
+	db = db.Limit(1)
+
+	var chunk Chunk
+	if err := db.First(&chunk).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("Chunk.GetParentChunkByBlockNumber error: %w", err)
+	}
+	return &chunk, nil
+}
+
 // InsertChunk inserts a new chunk into the database.
-func (o *Chunk) InsertChunk(ctx context.Context, chunk *encoding.Chunk, codecConfig rutils.CodecConfig, metrics utils.ChunkMetrics, dbTX ...*gorm.DB) (*Chunk, error) {
+func (o *Chunk) InsertChunk(ctx context.Context, chunk *encoding.Chunk, codecVersion encoding.CodecVersion, metrics rutils.ChunkMetrics, dbTX ...*gorm.DB) (*Chunk, error) {
 	if chunk == nil || len(chunk.Blocks) == 0 {
 		return nil, errors.New("invalid args")
 	}
@@ -187,7 +211,7 @@ func (o *Chunk) InsertChunk(ctx context.Context, chunk *encoding.Chunk, codecCon
 	var totalL1MessagePoppedBefore uint64
 	var parentChunkHash string
 	var parentChunkStateRoot string
-	parentChunk, err := o.getLatestChunk(ctx)
+	parentChunk, err := o.GetLatestChunk(ctx)
 	if err != nil {
 		log.Error("failed to get latest chunk", "err", err)
 		return nil, fmt.Errorf("Chunk.InsertChunk error: %w", err)
@@ -203,9 +227,15 @@ func (o *Chunk) InsertChunk(ctx context.Context, chunk *encoding.Chunk, codecCon
 		parentChunkStateRoot = parentChunk.StateRoot
 	}
 
-	chunkHash, err := utils.GetChunkHash(chunk, totalL1MessagePoppedBefore, codecConfig.Version)
+	chunkHash, err := rutils.GetChunkHash(chunk, totalL1MessagePoppedBefore, codecVersion)
 	if err != nil {
 		log.Error("failed to get chunk hash", "err", err)
+		return nil, fmt.Errorf("Chunk.InsertChunk error: %w", err)
+	}
+
+	enableCompress, err := encoding.GetChunkEnableCompression(codecVersion, chunk)
+	if err != nil {
+		log.Error("failed to get chunk enable compression", "version", codecVersion, "err", err)
 		return nil, fmt.Errorf("Chunk.InsertChunk error: %w", err)
 	}
 
@@ -217,22 +247,108 @@ func (o *Chunk) InsertChunk(ctx context.Context, chunk *encoding.Chunk, codecCon
 		StartBlockHash:               chunk.Blocks[0].Header.Hash().Hex(),
 		EndBlockNumber:               chunk.Blocks[numBlocks-1].Header.Number.Uint64(),
 		EndBlockHash:                 chunk.Blocks[numBlocks-1].Header.Hash().Hex(),
-		TotalL2TxGas:                 chunk.L2GasUsed(),
+		TotalL2TxGas:                 chunk.TotalGasUsed(),
 		TotalL2TxNum:                 chunk.NumL2Transactions(),
-		TotalL1CommitCalldataSize:    metrics.L1CommitCalldataSize,
-		TotalL1CommitGas:             metrics.L1CommitGas,
 		StartBlockTime:               chunk.Blocks[0].Header.Time,
 		TotalL1MessagesPoppedBefore:  totalL1MessagePoppedBefore,
 		TotalL1MessagesPoppedInChunk: chunk.NumL1Messages(totalL1MessagePoppedBefore),
+		PrevL1MessageQueueHash:       chunk.PrevL1MessageQueueHash.Hex(),
+		PostL1MessageQueueHash:       chunk.PostL1MessageQueueHash.Hex(),
 		ParentChunkHash:              parentChunkHash,
 		StateRoot:                    chunk.Blocks[numBlocks-1].Header.Root.Hex(),
 		ParentChunkStateRoot:         parentChunkStateRoot,
 		WithdrawRoot:                 chunk.Blocks[numBlocks-1].WithdrawRoot.Hex(),
-		CodecVersion:                 int16(codecConfig.Version),
-		EnableCompress:               codecConfig.EnableCompress,
+		CodecVersion:                 int16(codecVersion),
+		EnableCompress:               enableCompress,
 		ProvingStatus:                int16(types.ProvingTaskUnassigned),
-		CrcMax:                       metrics.CrcMax,
 		BlobSize:                     metrics.L1CommitBlobSize,
+	}
+
+	db := o.db
+	if len(dbTX) > 0 && dbTX[0] != nil {
+		db = dbTX[0]
+	}
+	db = db.WithContext(ctx)
+	db = db.Model(&Chunk{})
+
+	if err := db.Create(&newChunk).Error; err != nil {
+		return nil, fmt.Errorf("Chunk.InsertChunk error: %w, chunk hash: %v", err, newChunk.Hash)
+	}
+
+	return &newChunk, nil
+}
+
+func (o *Chunk) InsertPermissionlessChunk(ctx context.Context, index uint64, codecVersion encoding.CodecVersion, daBlobPayload encoding.DABlobPayload, totalL1MessagePoppedBefore uint64, stateRoot common.Hash) (*Chunk, error) {
+	// Create some unique identifier. It is not really used for anything except in DB.
+	var chunkBytes []byte
+	for _, block := range daBlobPayload.Blocks() {
+		blockBytes := block.Encode()
+		chunkBytes = append(chunkBytes, blockBytes...)
+	}
+	hash := crypto.Keccak256Hash(chunkBytes)
+
+	numBlocks := len(daBlobPayload.Blocks())
+	emptyHash := common.Hash{}.Hex()
+	newChunk := &Chunk{
+		Index:                        index,
+		Hash:                         hash.Hex(),
+		StartBlockNumber:             daBlobPayload.Blocks()[0].Number(),
+		StartBlockHash:               emptyHash,
+		EndBlockNumber:               daBlobPayload.Blocks()[numBlocks-1].Number(),
+		EndBlockHash:                 emptyHash,
+		StartBlockTime:               daBlobPayload.Blocks()[0].Timestamp(),
+		TotalL1MessagesPoppedInChunk: 0, // this needs to be 0 so that the calculation of the total L1 messages popped before for the next chunk is correct
+		TotalL1MessagesPoppedBefore:  totalL1MessagePoppedBefore,
+		PrevL1MessageQueueHash:       daBlobPayload.PrevL1MessageQueueHash().Hex(),
+		PostL1MessageQueueHash:       daBlobPayload.PostL1MessageQueueHash().Hex(),
+		ParentChunkHash:              emptyHash,
+		StateRoot:                    stateRoot.Hex(),
+		ParentChunkStateRoot:         emptyHash,
+		WithdrawRoot:                 emptyHash,
+		CodecVersion:                 int16(codecVersion),
+		EnableCompress:               false,
+		ProvingStatus:                int16(types.ProvingTaskVerified),
+	}
+
+	db := o.db.WithContext(ctx)
+	db = db.Model(&Chunk{})
+
+	if err := db.Create(newChunk).Error; err != nil {
+		return nil, fmt.Errorf("Chunk. InsertPermissionlessChunk error: %w, chunk hash: %v", err, newChunk.Hash)
+	}
+
+	return newChunk, nil
+}
+
+// InsertTestChunkForProposerTool inserts a new chunk into the database only for analysis usage by proposer tool.
+func (o *Chunk) InsertTestChunkForProposerTool(ctx context.Context, chunk *encoding.Chunk, codecVersion encoding.CodecVersion, totalL1MessagePoppedBefore uint64, dbTX ...*gorm.DB) (*Chunk, error) {
+	if chunk == nil || len(chunk.Blocks) == 0 {
+		return nil, errors.New("invalid args")
+	}
+
+	chunkHash, err := rutils.GetChunkHash(chunk, totalL1MessagePoppedBefore, codecVersion)
+	if err != nil {
+		log.Error("failed to get chunk hash", "err", err)
+		return nil, fmt.Errorf("Chunk.InsertChunk error: %w", err)
+	}
+
+	numBlocks := len(chunk.Blocks)
+	firstBlock := chunk.Blocks[0]
+	lastBlock := chunk.Blocks[numBlocks-1]
+	newChunk := Chunk{
+		Index:                       0,
+		Hash:                        chunkHash.Hex(),
+		StartBlockNumber:            firstBlock.Header.Number.Uint64(),
+		StartBlockHash:              firstBlock.Header.Hash().Hex(),
+		EndBlockNumber:              lastBlock.Header.Number.Uint64(),
+		EndBlockHash:                lastBlock.Header.Hash().Hex(),
+		TotalL2TxGas:                chunk.TotalGasUsed(),
+		TotalL2TxNum:                chunk.NumL2Transactions(),
+		StartBlockTime:              firstBlock.Header.Time,
+		TotalL1MessagesPoppedBefore: totalL1MessagePoppedBefore,
+		StateRoot:                   lastBlock.Header.Root.Hex(),
+		WithdrawRoot:                lastBlock.WithdrawRoot.Hex(),
+		CodecVersion:                int16(codecVersion),
 	}
 
 	db := o.db
@@ -256,11 +372,11 @@ func (o *Chunk) UpdateProvingStatus(ctx context.Context, hash string, status typ
 
 	switch status {
 	case types.ProvingTaskAssigned:
-		updateFields["prover_assigned_at"] = time.Now()
+		updateFields["prover_assigned_at"] = utils.NowUTC()
 	case types.ProvingTaskUnassigned:
 		updateFields["prover_assigned_at"] = nil
 	case types.ProvingTaskVerified:
-		updateFields["proved_at"] = time.Now()
+		updateFields["proved_at"] = utils.NowUTC()
 	}
 
 	db := o.db
@@ -284,11 +400,11 @@ func (o *Chunk) UpdateProvingStatusByBatchHash(ctx context.Context, batchHash st
 
 	switch status {
 	case types.ProvingTaskAssigned:
-		updateFields["prover_assigned_at"] = time.Now()
+		updateFields["prover_assigned_at"] = utils.NowUTC()
 	case types.ProvingTaskUnassigned:
 		updateFields["prover_assigned_at"] = nil
 	case types.ProvingTaskVerified:
-		updateFields["proved_at"] = time.Now()
+		updateFields["proved_at"] = utils.NowUTC()
 	}
 
 	db := o.db

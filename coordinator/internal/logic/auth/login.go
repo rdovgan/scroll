@@ -21,35 +21,23 @@ import (
 type LoginLogic struct {
 	cfg          *config.Config
 	challengeOrm *orm.Challenge
-	chunkVks     map[string]struct{}
-	batchVKs     map[string]struct{}
-	bundleVks    map[string]struct{}
 
-	proverVersionHardForkMap map[string][]string
+	openVmVks map[string]struct{}
+
+	proverVersionHardForkMap map[string]string
 }
 
 // NewLoginLogic new a LoginLogic
 func NewLoginLogic(db *gorm.DB, cfg *config.Config, vf *verifier.Verifier) *LoginLogic {
-	proverVersionHardForkMap := make(map[string][]string)
-	if version.CheckScrollRepoVersion(cfg.ProverManager.Verifier.LowVersionCircuit.MinProverVersion, cfg.ProverManager.Verifier.HighVersionCircuit.MinProverVersion) {
-		log.Error("config file error, low verifier min_prover_version should not more than high verifier min_prover_version",
-			"low verifier min_prover_version", cfg.ProverManager.Verifier.LowVersionCircuit.MinProverVersion,
-			"high verifier min_prover_version", cfg.ProverManager.Verifier.HighVersionCircuit.MinProverVersion)
-		panic("verifier config file error")
+	proverVersionHardForkMap := make(map[string]string)
+
+	for _, cfg := range cfg.ProverManager.Verifier.Verifiers {
+		proverVersionHardForkMap[cfg.ForkName] = cfg.MinProverVersion
 	}
-
-	var highHardForks []string
-	highHardForks = append(highHardForks, cfg.ProverManager.Verifier.HighVersionCircuit.ForkName)
-	highHardForks = append(highHardForks, cfg.ProverManager.Verifier.LowVersionCircuit.ForkName)
-	proverVersionHardForkMap[cfg.ProverManager.Verifier.HighVersionCircuit.MinProverVersion] = highHardForks
-
-	proverVersionHardForkMap[cfg.ProverManager.Verifier.LowVersionCircuit.MinProverVersion] = []string{cfg.ProverManager.Verifier.LowVersionCircuit.ForkName}
 
 	return &LoginLogic{
 		cfg:                      cfg,
-		chunkVks:                 vf.ChunkVKMap,
-		batchVKs:                 vf.BatchVKMap,
-		bundleVks:                vf.BundleVkMap,
+		openVmVks:                vf.OpenVMVkMap,
 		challengeOrm:             orm.NewChallenge(db),
 		proverVersionHardForkMap: proverVersionHardForkMap,
 	}
@@ -68,44 +56,38 @@ func (l *LoginLogic) Check(login *types.LoginParameter) error {
 		return errors.New("auth message verify failure")
 	}
 
-	if !version.CheckScrollRepoVersion(login.Message.ProverVersion, l.cfg.ProverManager.Verifier.LowVersionCircuit.MinProverVersion) {
-		return fmt.Errorf("incompatible prover version. please upgrade your prover, minimum allowed version: %s, actual version: %s",
-			l.cfg.ProverManager.Verifier.LowVersionCircuit.MinProverVersion, login.Message.ProverVersion)
+	if !version.CheckScrollRepoVersion(login.Message.ProverVersion, l.cfg.ProverManager.Verifier.MinProverVersion) {
+		return fmt.Errorf("incompatible prover version. please upgrade your prover, minimum allowed version: %s, actual version: %s", l.cfg.ProverManager.Verifier.MinProverVersion, login.Message.ProverVersion)
 	}
 
-	if len(login.Message.ProverTypes) > 0 {
-		vks := make(map[string]struct{})
-		for _, proverType := range login.Message.ProverTypes {
-			switch proverType {
-			case types.ProverTypeChunk:
-				for vk := range l.chunkVks {
-					vks[vk] = struct{}{}
-				}
-			case types.ProverTypeBatch:
-				for vk := range l.batchVKs {
-					vks[vk] = struct{}{}
-				}
-				for vk := range l.bundleVks {
-					vks[vk] = struct{}{}
-				}
-			default:
-				log.Error("invalid prover_type", "value", proverType, "prover name", login.Message.ProverName, "prover_version", login.Message.ProverVersion)
-			}
-		}
+	vks := make(map[string]struct{})
+	for vk := range l.openVmVks {
+		vks[vk] = struct{}{}
+	}
 
-		for _, vk := range login.Message.VKs {
-			if _, ok := vks[vk]; !ok {
-				log.Error("vk inconsistency", "prover vk", vk, "prover name", login.Message.ProverName,
-					"prover_version", login.Message.ProverVersion, "message", login.Message)
-				if !version.CheckScrollProverVersion(login.Message.ProverVersion) {
-					return fmt.Errorf("incompatible prover version. please upgrade your prover, expect version: %s, actual version: %s",
-						version.Version, login.Message.ProverVersion)
-				}
-				// if the prover reports a same prover version
-				return errors.New("incompatible vk. please check your params files or config files")
+	for _, vk := range login.Message.VKs {
+		if _, ok := vks[vk]; !ok {
+			log.Error("vk inconsistency", "prover vk", vk, "prover name", login.Message.ProverName,
+				"prover_version", login.Message.ProverVersion, "message", login.Message)
+			if !version.CheckScrollProverVersion(login.Message.ProverVersion) {
+				return fmt.Errorf("incompatible prover version. please upgrade your prover, expect version: %s, actual version: %s",
+					version.Version, login.Message.ProverVersion)
 			}
+			// if the prover reports a same prover version
+			return errors.New("incompatible vk. please check your params files or config files")
 		}
 	}
+
+	if login.Message.ProverProviderType != types.ProverProviderTypeInternal && login.Message.ProverProviderType != types.ProverProviderTypeExternal {
+		// for backward compatibility, set ProverProviderType as internal
+		if login.Message.ProverProviderType == types.ProverProviderTypeUndefined {
+			login.Message.ProverProviderType = types.ProverProviderTypeInternal
+		} else {
+			log.Error("invalid prover_provider_type", "value", login.Message.ProverProviderType, "prover name", login.Message.ProverName, "prover version", login.Message.ProverVersion)
+			return errors.New("invalid prover provider type.")
+		}
+	}
+
 	return nil
 }
 
@@ -117,9 +99,15 @@ func (l *LoginLogic) ProverHardForkName(login *types.LoginParameter) (string, er
 	}
 
 	proverVersion := proverVersionSplits[0]
-	if hardForkNames, ok := l.proverVersionHardForkMap[proverVersion]; ok {
-		return strings.Join(hardForkNames, ","), nil
+	var hardForkNames []string
+	for n, minVersion := range l.proverVersionHardForkMap {
+		if minVersion == "" || version.CheckScrollRepoVersion(proverVersion, minVersion) {
+			hardForkNames = append(hardForkNames, n)
+		}
+	}
+	if len(hardForkNames) == 0 {
+		return "", fmt.Errorf("invalid prover prover_version:%s", login.Message.ProverVersion)
 	}
 
-	return "", fmt.Errorf("invalid prover prover_version:%s", login.Message.ProverVersion)
+	return strings.Join(hardForkNames, ","), nil
 }

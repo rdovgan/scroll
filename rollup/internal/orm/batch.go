@@ -5,11 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 	"time"
 
 	"github.com/scroll-tech/da-codec/encoding"
-	"github.com/scroll-tech/go-ethereum/log"
 	"gorm.io/gorm"
+
+	"github.com/scroll-tech/go-ethereum/common"
+	"github.com/scroll-tech/go-ethereum/log"
 
 	"scroll-tech/common/types"
 	"scroll-tech/common/types/message"
@@ -23,20 +26,23 @@ type Batch struct {
 	db *gorm.DB `gorm:"column:-"`
 
 	// batch
-	Index           uint64 `json:"index" gorm:"column:index"`
-	Hash            string `json:"hash" gorm:"column:hash"`
-	DataHash        string `json:"data_hash" gorm:"column:data_hash"`
-	StartChunkIndex uint64 `json:"start_chunk_index" gorm:"column:start_chunk_index"`
-	StartChunkHash  string `json:"start_chunk_hash" gorm:"column:start_chunk_hash"`
-	EndChunkIndex   uint64 `json:"end_chunk_index" gorm:"column:end_chunk_index"`
-	EndChunkHash    string `json:"end_chunk_hash" gorm:"column:end_chunk_hash"`
-	StateRoot       string `json:"state_root" gorm:"column:state_root"`
-	WithdrawRoot    string `json:"withdraw_root" gorm:"column:withdraw_root"`
-	ParentBatchHash string `json:"parent_batch_hash" gorm:"column:parent_batch_hash"`
-	BatchHeader     []byte `json:"batch_header" gorm:"column:batch_header"`
-	CodecVersion    int16  `json:"codec_version" gorm:"column:codec_version"`
-	EnableCompress  bool   `json:"enable_compress" gorm:"column:enable_compress"`
-	BlobBytes       []byte `json:"blob_bytes" gorm:"column:blob_bytes"`
+	Index                  uint64 `json:"index" gorm:"column:index"`
+	Hash                   string `json:"hash" gorm:"column:hash"`
+	DataHash               string `json:"data_hash" gorm:"column:data_hash"`
+	StartChunkIndex        uint64 `json:"start_chunk_index" gorm:"column:start_chunk_index"`
+	StartChunkHash         string `json:"start_chunk_hash" gorm:"column:start_chunk_hash"`
+	EndChunkIndex          uint64 `json:"end_chunk_index" gorm:"column:end_chunk_index"`
+	EndChunkHash           string `json:"end_chunk_hash" gorm:"column:end_chunk_hash"`
+	StateRoot              string `json:"state_root" gorm:"column:state_root"`
+	WithdrawRoot           string `json:"withdraw_root" gorm:"column:withdraw_root"`
+	ParentBatchHash        string `json:"parent_batch_hash" gorm:"column:parent_batch_hash"`
+	BatchHeader            []byte `json:"batch_header" gorm:"column:batch_header"`
+	CodecVersion           int16  `json:"codec_version" gorm:"column:codec_version"`
+	PrevL1MessageQueueHash string `json:"prev_l1_message_queue_hash" gorm:"column:prev_l1_message_queue_hash"`
+	PostL1MessageQueueHash string `json:"post_l1_message_queue_hash" gorm:"column:post_l1_message_queue_hash"`
+	EnableCompress         bool   `json:"enable_compress" gorm:"column:enable_compress"` // use for debug
+	BlobBytes              []byte `json:"blob_bytes" gorm:"column:blob_bytes"`
+	ChallengeDigest        string `json:"challenge_digest" gorm:"column:challenge_digest"`
 
 	// proof
 	ChunkProofsStatus int16      `json:"chunk_proofs_status" gorm:"column:chunk_proofs_status;default:1"`
@@ -52,10 +58,6 @@ type Batch struct {
 	CommittedAt    *time.Time `json:"committed_at" gorm:"column:committed_at;default:NULL"`
 	FinalizeTxHash string     `json:"finalize_tx_hash" gorm:"column:finalize_tx_hash;default:NULL"`
 	FinalizedAt    *time.Time `json:"finalized_at" gorm:"column:finalized_at;default:NULL"`
-
-	// gas oracle
-	OracleStatus int16  `json:"oracle_status" gorm:"column:oracle_status;default:1"`
-	OracleTxHash string `json:"oracle_tx_hash" gorm:"column:oracle_tx_hash;default:NULL"`
 
 	// blob
 	BlobDataProof []byte `json:"blob_data_proof" gorm:"column:blob_data_proof"`
@@ -122,7 +124,7 @@ func (o *Batch) GetBatchCount(ctx context.Context) (uint64, error) {
 }
 
 // GetVerifiedProofByHash retrieves the verified aggregate proof for a batch with the given hash.
-func (o *Batch) GetVerifiedProofByHash(ctx context.Context, hash string) (*message.BatchProof, error) {
+func (o *Batch) GetVerifiedProofByHash(ctx context.Context, hash string) (*message.OpenVMBatchProof, error) {
 	db := o.db.WithContext(ctx)
 	db = db.Model(&Batch{})
 	db = db.Select("proof")
@@ -133,7 +135,7 @@ func (o *Batch) GetVerifiedProofByHash(ctx context.Context, hash string) (*messa
 		return nil, fmt.Errorf("Batch.GetVerifiedProofByHash error: %w, batch hash: %v", err, hash)
 	}
 
-	var proof message.BatchProof
+	var proof message.OpenVMBatchProof
 	if err := json.Unmarshal(batch.Proof, &proof); err != nil {
 		return nil, fmt.Errorf("Batch.GetVerifiedProofByHash error: %w, batch hash: %v", err, hash)
 	}
@@ -163,13 +165,16 @@ func (o *Batch) GetFirstUnbatchedChunkIndex(ctx context.Context) (uint64, error)
 	return latestBatch.EndChunkIndex + 1, nil
 }
 
-// GetBatchesGEIndexGECodecVersion retrieves batches that have a batch index greater than or equal to the given index and codec version.
+// GetCommittedBatchesGEIndexGECodecVersion retrieves batches that have been committed (commit_tx_hash is set) and not finalized (finalize_tx_hash is NULL).
+// It returns batches that have an index greater than or equal to the given index and codec version.
 // The returned batches are sorted in ascending order by their index.
-func (o *Batch) GetBatchesGEIndexGECodecVersion(ctx context.Context, index uint64, codecv encoding.CodecVersion, limit int) ([]*Batch, error) {
+func (o *Batch) GetCommittedBatchesGEIndexGECodecVersion(ctx context.Context, index uint64, codecv encoding.CodecVersion, limit int) ([]*Batch, error) {
 	db := o.db.WithContext(ctx)
 	db = db.Model(&Batch{})
 	db = db.Where("index >= ?", index)
 	db = db.Where("codec_version >= ?", codecv)
+	db = db.Where("commit_tx_hash IS NOT NULL") // only include committed batches
+	db = db.Where("finalize_tx_hash IS NULL")   // exclude finalized batches
 	db = db.Order("index ASC")
 
 	if limit > 0 {
@@ -178,7 +183,7 @@ func (o *Batch) GetBatchesGEIndexGECodecVersion(ctx context.Context, index uint6
 
 	var batches []*Batch
 	if err := db.Find(&batches).Error; err != nil {
-		return nil, fmt.Errorf("Batch.GetBatchesGEIndexGECodecVersion error: %w", err)
+		return nil, fmt.Errorf("Batch.GetCommittedBatchesGEIndexGECodecVersion error: %w", err)
 	}
 	return batches, nil
 }
@@ -216,6 +221,18 @@ func (o *Batch) GetRollupStatusByHashList(ctx context.Context, hashes []string) 
 	return statuses, nil
 }
 
+func (o *Batch) GetFailedAndPendingBatchesCount(ctx context.Context) (int64, error) {
+	db := o.db.WithContext(ctx)
+	db = db.Model(&Batch{})
+	db = db.Where("rollup_status = ? OR rollup_status = ?", types.RollupCommitFailed, types.RollupPending)
+
+	var count int64
+	if err := db.Count(&count).Error; err != nil {
+		return 0, fmt.Errorf("Batch.GetFailedAndPendingBatchesCount error: %w", err)
+	}
+	return count, nil
+}
+
 // GetFailedAndPendingBatches retrieves batches with failed or pending status up to the specified limit.
 // The returned batches are sorted in ascending order by their index.
 func (o *Batch) GetFailedAndPendingBatches(ctx context.Context, limit int) ([]*Batch, error) {
@@ -249,8 +266,21 @@ func (o *Batch) GetBatchByIndex(ctx context.Context, index uint64) (*Batch, erro
 	return &batch, nil
 }
 
+// GetBatchByHash retrieves the batch by the given hash.
+func (o *Batch) GetBatchByHash(ctx context.Context, hash string) (*Batch, error) {
+	db := o.db.WithContext(ctx)
+	db = db.Model(&Batch{})
+	db = db.Where("hash = ?", hash)
+
+	var batch Batch
+	if err := db.First(&batch).Error; err != nil {
+		return nil, fmt.Errorf("Batch.GetBatchByHash error: %w, batch hash: %v", err, hash)
+	}
+	return &batch, nil
+}
+
 // InsertBatch inserts a new batch into the database.
-func (o *Batch) InsertBatch(ctx context.Context, batch *encoding.Batch, codecConfig rutils.CodecConfig, metrics rutils.BatchMetrics, dbTX ...*gorm.DB) (*Batch, error) {
+func (o *Batch) InsertBatch(ctx context.Context, batch *encoding.Batch, codecVersion encoding.CodecVersion, metrics rutils.BatchMetrics, dbTX ...*gorm.DB) (*Batch, error) {
 	if batch == nil {
 		return nil, errors.New("invalid args: batch is nil")
 	}
@@ -265,42 +295,49 @@ func (o *Batch) InsertBatch(ctx context.Context, batch *encoding.Batch, codecCon
 		parentBatch, getErr := o.GetBatchByIndex(ctx, batch.Index-1)
 		if getErr != nil {
 			log.Error("failed to get batch by index", "index", batch.Index, "total l1 message popped before", batch.TotalL1MessagePoppedBefore,
-				"parent hash", batch.ParentBatchHash, "number of chunks", numChunks, "err", getErr)
+				"parent hash", batch.ParentBatchHash.Hex(), "number of chunks", numChunks, "err", getErr)
 			return nil, fmt.Errorf("Batch.InsertBatch error: %w", getErr)
 		}
 		startChunkIndex = parentBatch.EndChunkIndex + 1
 	}
 
-	batchMeta, err := rutils.GetBatchMetadata(batch, codecConfig)
+	batchMeta, err := rutils.GetBatchMetadata(batch, codecVersion, metrics.ValidiumMode)
 	if err != nil {
 		log.Error("failed to get batch metadata", "index", batch.Index, "total l1 message popped before", batch.TotalL1MessagePoppedBefore,
-			"parent hash", batch.ParentBatchHash, "number of chunks", numChunks, "err", err)
+			"parent hash", batch.ParentBatchHash.Hex(), "number of chunks", numChunks, "err", err)
+		return nil, fmt.Errorf("Batch.InsertBatch error: %w", err)
+	}
+
+	enableCompress, err := encoding.GetBatchEnableCompression(codecVersion, batch)
+	if err != nil {
+		log.Error("failed to get batch enable compress", "index", batch.Index, "total l1 message popped before", batch.TotalL1MessagePoppedBefore,
+			"parent hash", batch.ParentBatchHash.Hex(), "number of chunks", numChunks, "err", err)
 		return nil, fmt.Errorf("Batch.InsertBatch error: %w", err)
 	}
 
 	newBatch := Batch{
-		Index:                     batch.Index,
-		Hash:                      batchMeta.BatchHash.Hex(),
-		DataHash:                  batchMeta.BatchDataHash.Hex(),
-		StartChunkHash:            batchMeta.StartChunkHash.Hex(),
-		StartChunkIndex:           startChunkIndex,
-		EndChunkHash:              batchMeta.EndChunkHash.Hex(),
-		EndChunkIndex:             startChunkIndex + numChunks - 1,
-		StateRoot:                 batch.StateRoot().Hex(),
-		WithdrawRoot:              batch.WithdrawRoot().Hex(),
-		ParentBatchHash:           batch.ParentBatchHash.Hex(),
-		BatchHeader:               batchMeta.BatchBytes,
-		CodecVersion:              int16(codecConfig.Version),
-		EnableCompress:            codecConfig.EnableCompress,
-		BlobBytes:                 batchMeta.BlobBytes,
-		ChunkProofsStatus:         int16(types.ChunkProofsStatusPending),
-		ProvingStatus:             int16(types.ProvingTaskUnassigned),
-		RollupStatus:              int16(types.RollupPending),
-		OracleStatus:              int16(types.GasOraclePending),
-		TotalL1CommitGas:          metrics.L1CommitGas,
-		TotalL1CommitCalldataSize: metrics.L1CommitCalldataSize,
-		BlobDataProof:             batchMeta.BatchBlobDataProof,
-		BlobSize:                  metrics.L1CommitBlobSize,
+		Index:                  batch.Index,
+		Hash:                   batchMeta.BatchHash.Hex(),
+		DataHash:               batchMeta.BatchDataHash.Hex(),
+		StartChunkHash:         batchMeta.StartChunkHash.Hex(),
+		StartChunkIndex:        startChunkIndex,
+		EndChunkHash:           batchMeta.EndChunkHash.Hex(),
+		EndChunkIndex:          startChunkIndex + numChunks - 1,
+		StateRoot:              batch.StateRoot().Hex(),
+		WithdrawRoot:           batch.WithdrawRoot().Hex(),
+		ParentBatchHash:        batch.ParentBatchHash.Hex(),
+		BatchHeader:            batchMeta.BatchBytes,
+		CodecVersion:           int16(codecVersion),
+		PrevL1MessageQueueHash: batch.PrevL1MessageQueueHash.Hex(),
+		PostL1MessageQueueHash: batch.PostL1MessageQueueHash.Hex(),
+		EnableCompress:         enableCompress,
+		BlobBytes:              batchMeta.BlobBytes,
+		ChallengeDigest:        batchMeta.ChallengeDigest.Hex(),
+		ChunkProofsStatus:      int16(types.ChunkProofsStatusPending),
+		ProvingStatus:          int16(types.ProvingTaskUnassigned),
+		RollupStatus:           int16(types.RollupPending),
+		BlobDataProof:          batchMeta.BatchBlobDataProof,
+		BlobSize:               metrics.L1CommitBlobSize,
 	}
 
 	db := o.db
@@ -317,20 +354,35 @@ func (o *Batch) InsertBatch(ctx context.Context, batch *encoding.Batch, codecCon
 	return &newBatch, nil
 }
 
-// UpdateL2GasOracleStatusAndOracleTxHash updates the L2 gas oracle status and transaction hash for a batch.
-func (o *Batch) UpdateL2GasOracleStatusAndOracleTxHash(ctx context.Context, hash string, status types.GasOracleStatus, txHash string) error {
-	updateFields := make(map[string]interface{})
-	updateFields["oracle_status"] = int(status)
-	updateFields["oracle_tx_hash"] = txHash
+func (o *Batch) InsertPermissionlessBatch(ctx context.Context, batchIndex *big.Int, batchHash common.Hash, codecVersion encoding.CodecVersion, chunk *Chunk) (*Batch, error) {
+	now := time.Now()
+	newBatch := &Batch{
+		Index:                  batchIndex.Uint64(),
+		Hash:                   batchHash.Hex(),
+		StartChunkIndex:        chunk.Index,
+		StartChunkHash:         chunk.Hash,
+		EndChunkIndex:          chunk.Index,
+		EndChunkHash:           chunk.Hash,
+		StateRoot:              chunk.StateRoot,
+		PrevL1MessageQueueHash: chunk.PrevL1MessageQueueHash,
+		PostL1MessageQueueHash: chunk.PostL1MessageQueueHash,
+		BatchHeader:            []byte{1, 2, 3},
+		CodecVersion:           int16(codecVersion),
+		EnableCompress:         false,
+		ProvingStatus:          int16(types.ProvingTaskVerified),
+		ProvedAt:               &now,
+		RollupStatus:           int16(types.RollupFinalized),
+		FinalizedAt:            &now,
+	}
 
 	db := o.db.WithContext(ctx)
 	db = db.Model(&Batch{})
-	db = db.Where("hash", hash)
 
-	if err := db.Updates(updateFields).Error; err != nil {
-		return fmt.Errorf("Batch.UpdateL2GasOracleStatusAndOracleTxHash error: %w, batch hash: %v, status: %v, txHash: %v", err, hash, status.String(), txHash)
+	if err := db.Create(newBatch).Error; err != nil {
+		return nil, fmt.Errorf("Batch.InsertPermissionlessBatch error: %w", err)
 	}
-	return nil
+
+	return newBatch, nil
 }
 
 // UpdateProvingStatus updates the proving status of a batch.
@@ -340,11 +392,11 @@ func (o *Batch) UpdateProvingStatus(ctx context.Context, hash string, status typ
 
 	switch status {
 	case types.ProvingTaskAssigned:
-		updateFields["prover_assigned_at"] = time.Now()
+		updateFields["prover_assigned_at"] = utils.NowUTC()
 	case types.ProvingTaskUnassigned:
 		updateFields["prover_assigned_at"] = nil
 	case types.ProvingTaskVerified:
-		updateFields["proved_at"] = time.Now()
+		updateFields["proved_at"] = utils.NowUTC()
 	}
 
 	db := o.db
@@ -357,6 +409,29 @@ func (o *Batch) UpdateProvingStatus(ctx context.Context, hash string, status typ
 
 	if err := db.Updates(updateFields).Error; err != nil {
 		return fmt.Errorf("Batch.UpdateProvingStatus error: %w, batch hash: %v, status: %v", err, hash, status.String())
+	}
+	return nil
+}
+
+func (o *Batch) UpdateRollupStatusCommitAndFinalizeTxHash(ctx context.Context, hash string, status types.RollupStatus, commitTxHash string, finalizeTxHash string, dbTX ...*gorm.DB) error {
+	updateFields := make(map[string]interface{})
+	updateFields["commit_tx_hash"] = commitTxHash
+	updateFields["committed_at"] = utils.NowUTC()
+	updateFields["finalize_tx_hash"] = finalizeTxHash
+	updateFields["finalized_at"] = utils.NowUTC()
+
+	updateFields["rollup_status"] = int(status)
+
+	db := o.db
+	if len(dbTX) > 0 && dbTX[0] != nil {
+		db = dbTX[0]
+	}
+	db = db.WithContext(ctx)
+	db = db.Model(&Batch{})
+	db = db.Where("hash", hash)
+
+	if err := db.Updates(updateFields).Error; err != nil {
+		return fmt.Errorf("Batch.UpdateRollupStatusCommitAndFinalizeTxHash error: %w, batch hash: %v, status: %v, commitTxHash: %v, finalizeTxHash: %v", err, hash, status.String(), commitTxHash, finalizeTxHash)
 	}
 	return nil
 }
@@ -388,15 +463,25 @@ func (o *Batch) UpdateRollupStatus(ctx context.Context, hash string, status type
 }
 
 // UpdateCommitTxHashAndRollupStatus updates the commit transaction hash and rollup status for a batch.
-func (o *Batch) UpdateCommitTxHashAndRollupStatus(ctx context.Context, hash string, commitTxHash string, status types.RollupStatus) error {
+func (o *Batch) UpdateCommitTxHashAndRollupStatus(ctx context.Context, hash string, commitTxHash string, status types.RollupStatus, dbTX ...*gorm.DB) error {
 	updateFields := make(map[string]interface{})
 	updateFields["commit_tx_hash"] = commitTxHash
-	updateFields["rollup_status"] = int(status)
+	updateFields["rollup_status"] = gorm.Expr(
+		`CASE
+			WHEN rollup_status NOT IN (?, ?) THEN ?
+			ELSE rollup_status
+		END`,
+		types.RollupFinalizing, types.RollupFinalized, int(status))
 	if status == types.RollupCommitted {
 		updateFields["committed_at"] = utils.NowUTC()
 	}
 
-	db := o.db.WithContext(ctx)
+	db := o.db
+	if len(dbTX) > 0 && dbTX[0] != nil {
+		db = dbTX[0]
+	}
+	db = db.WithContext(ctx)
+
 	db = db.Model(&Batch{})
 	db = db.Where("hash", hash)
 
@@ -412,7 +497,7 @@ func (o *Batch) UpdateFinalizeTxHashAndRollupStatus(ctx context.Context, hash st
 	updateFields["finalize_tx_hash"] = finalizeTxHash
 	updateFields["rollup_status"] = int(status)
 	if status == types.RollupFinalized {
-		updateFields["finalized_at"] = time.Now()
+		updateFields["finalized_at"] = utils.NowUTC()
 	}
 
 	db := o.db.WithContext(ctx)
@@ -427,7 +512,7 @@ func (o *Batch) UpdateFinalizeTxHashAndRollupStatus(ctx context.Context, hash st
 
 // UpdateProofByHash updates the batch proof by hash.
 // for unit test.
-func (o *Batch) UpdateProofByHash(ctx context.Context, hash string, proof *message.BatchProof, proofTimeSec uint64) error {
+func (o *Batch) UpdateProofByHash(ctx context.Context, hash string, proof *message.OpenVMBatchProof, proofTimeSec uint64) error {
 	proofBytes, err := json.Marshal(proof)
 	if err != nil {
 		return fmt.Errorf("Batch.UpdateProofByHash error: %w, batch hash: %v", err, hash)
@@ -471,11 +556,11 @@ func (o *Batch) UpdateProvingStatusByBundleHash(ctx context.Context, bundleHash 
 
 	switch status {
 	case types.ProvingTaskAssigned:
-		updateFields["prover_assigned_at"] = time.Now()
+		updateFields["prover_assigned_at"] = utils.NowUTC()
 	case types.ProvingTaskUnassigned:
 		updateFields["prover_assigned_at"] = nil
 	case types.ProvingTaskVerified:
-		updateFields["proved_at"] = time.Now()
+		updateFields["proved_at"] = utils.NowUTC()
 	}
 
 	db := o.db

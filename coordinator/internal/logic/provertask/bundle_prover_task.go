@@ -9,18 +9,19 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/scroll-tech/go-ethereum/common"
 	"github.com/scroll-tech/go-ethereum/log"
 	"github.com/scroll-tech/go-ethereum/params"
 	"gorm.io/gorm"
 
-	"scroll-tech/common/forks"
-	"scroll-tech/common/types"
-	"scroll-tech/common/types/message"
-	"scroll-tech/common/utils"
-
 	"scroll-tech/coordinator/internal/config"
 	"scroll-tech/coordinator/internal/orm"
 	coordinatorType "scroll-tech/coordinator/internal/types"
+	cutils "scroll-tech/coordinator/internal/utils"
+
+	"scroll-tech/common/types"
+	"scroll-tech/common/types/message"
+	"scroll-tech/common/utils"
 )
 
 // BundleProverTask is prover task implement for bundle proof
@@ -32,12 +33,13 @@ type BundleProverTask struct {
 }
 
 // NewBundleProverTask new a bundle collector
-func NewBundleProverTask(cfg *config.Config, chainCfg *params.ChainConfig, db *gorm.DB, reg prometheus.Registerer) *BundleProverTask {
+func NewBundleProverTask(cfg *config.Config, chainCfg *params.ChainConfig, db *gorm.DB, expectedVk map[string][]byte, reg prometheus.Registerer) *BundleProverTask {
 	bp := &BundleProverTask{
 		BaseProverTask: BaseProverTask{
 			db:                 db,
 			chainCfg:           chainCfg,
 			cfg:                cfg,
+			expectedVk:         expectedVk,
 			blockOrm:           orm.NewL2Block(db),
 			chunkOrm:           orm.NewChunk(db),
 			batchOrm:           orm.NewBatch(db),
@@ -63,14 +65,54 @@ func (bp *BundleProverTask) Assign(ctx *gin.Context, getTaskParameter *coordinat
 
 	maxActiveAttempts := bp.cfg.ProverManager.ProversPerSession
 	maxTotalAttempts := bp.cfg.ProverManager.SessionAttempts
+	if taskCtx.ProverProviderType == uint8(coordinatorType.ProverProviderTypeExternal) {
+		unassignedBundleCount, getCountError := bp.bundleOrm.GetUnassignedBundleCount(ctx.Copy(), maxActiveAttempts, maxTotalAttempts)
+		if getCountError != nil {
+			log.Error("failed to get unassigned bundle proving tasks count", "height", getTaskParameter.ProverHeight, "err", getCountError)
+			return nil, ErrCoordinatorInternalFailure
+		}
+		// Assign external prover if unassigned task number exceeds threshold
+		if unassignedBundleCount < bp.cfg.ProverManager.ExternalProverThreshold {
+			return nil, nil
+		}
+	}
+
 	var bundleTask *orm.Bundle
+	var hardForkName string
 	for i := 0; i < 5; i++ {
 		var getTaskError error
 		var tmpBundleTask *orm.Bundle
-		tmpBundleTask, getTaskError = bp.bundleOrm.GetAssignedBundle(ctx.Copy(), maxActiveAttempts, maxTotalAttempts)
-		if getTaskError != nil {
-			log.Error("failed to get assigned bundle proving tasks", "height", getTaskParameter.ProverHeight, "err", getTaskError)
-			return nil, ErrCoordinatorInternalFailure
+
+		if taskCtx.hasAssignedTask != nil {
+			if taskCtx.hasAssignedTask.TaskType != int16(message.ProofTypeBundle) {
+				return nil, fmt.Errorf("prover with publicKey %s is already assigned a task. ProverName: %s, ProverVersion: %s", taskCtx.PublicKey, taskCtx.ProverName, taskCtx.ProverVersion)
+			}
+
+			tmpBundleTask, getTaskError = bp.bundleOrm.GetBundleByHash(ctx.Copy(), taskCtx.hasAssignedTask.TaskID)
+			if getTaskError != nil {
+				log.Error("failed to get bundle has assigned to prover", "taskID", taskCtx.hasAssignedTask.TaskID, "err", getTaskError)
+				return nil, ErrCoordinatorInternalFailure
+			} else if tmpBundleTask == nil {
+				// if the assigned chunk dropped, there would be too much issue to assign another
+				return nil, fmt.Errorf("prover with publicKey %s is already assigned a dropped bundle. ProverName: %s, ProverVersion: %s",
+					taskCtx.PublicKey, taskCtx.ProverName, taskCtx.ProverVersion)
+			}
+		} else if getTaskParameter.TaskID != "" {
+			tmpBundleTask, getTaskError = bp.bundleOrm.GetBundleByHash(ctx.Copy(), getTaskParameter.TaskID)
+			if getTaskError != nil {
+				log.Error("failed to get expected bundle", "taskID", getTaskParameter.TaskID, "err", getTaskError)
+				return nil, ErrCoordinatorInternalFailure
+			} else if tmpBundleTask == nil {
+				return nil, fmt.Errorf("Expected task (%s) is already dropped", getTaskParameter.TaskID)
+			}
+		}
+
+		if tmpBundleTask == nil {
+			tmpBundleTask, getTaskError = bp.bundleOrm.GetAssignedBundle(ctx.Copy(), maxActiveAttempts, maxTotalAttempts)
+			if getTaskError != nil {
+				log.Error("failed to get assigned bundle proving tasks", "height", getTaskParameter.ProverHeight, "err", getTaskError)
+				return nil, ErrCoordinatorInternalFailure
+			}
 		}
 
 		// Why here need get again? In order to support a task can assign to multiple prover, need also assign `ProvingTaskAssigned`
@@ -88,17 +130,43 @@ func (bp *BundleProverTask) Assign(ctx *gin.Context, getTaskParameter *coordinat
 			return nil, nil
 		}
 
-		rowsAffected, updateAttemptsErr := bp.bundleOrm.UpdateBundleAttempts(ctx.Copy(), tmpBundleTask.Hash, tmpBundleTask.ActiveAttempts, tmpBundleTask.TotalAttempts)
-		if updateAttemptsErr != nil {
-			log.Error("failed to update bundle attempts", "height", getTaskParameter.ProverHeight, "err", updateAttemptsErr)
-			return nil, ErrCoordinatorInternalFailure
+		taskCtx.taskType = message.ProofTypeBundle
+		taskCtx.bundleTask = tmpBundleTask
+
+		var checkErr error
+		hardForkName, checkErr = bp.hardForkSanityCheck(ctx, taskCtx)
+		if checkErr != nil {
+			log.Debug("hard fork sanity check failed", "height", getTaskParameter.ProverHeight, "err", checkErr)
+			return nil, nil
 		}
 
-		if rowsAffected == 0 {
-			time.Sleep(100 * time.Millisecond)
-			continue
-		}
+		// we are simply pick the chunk which has been assigned, so don't bother to update attempts or check failed before
+		if taskCtx.hasAssignedTask == nil {
+			// Don't dispatch the same failing job to the same prover
+			proverTasks, getTaskError := bp.proverTaskOrm.GetFailedProverTasksByHash(ctx.Copy(), message.ProofTypeBundle, tmpBundleTask.Hash, 2)
+			if getTaskError != nil {
+				log.Error("failed to get prover tasks", "proof type", message.ProofTypeBundle.String(), "task ID", tmpBundleTask.Hash, "error", getTaskError)
+				return nil, ErrCoordinatorInternalFailure
+			}
+			for i := 0; i < len(proverTasks); i++ {
+				if proverTasks[i].ProverPublicKey == taskCtx.PublicKey ||
+					taskCtx.ProverProviderType == uint8(coordinatorType.ProverProviderTypeExternal) && cutils.IsExternalProverNameMatch(proverTasks[i].ProverName, taskCtx.ProverName) {
+					log.Debug("get empty bundle, the prover already failed this task", "height", getTaskParameter.ProverHeight, "task ID", tmpBundleTask.Hash, "prover name", taskCtx.ProverName, "prover public key", taskCtx.PublicKey)
+					return nil, nil
+				}
+			}
 
+			rowsAffected, updateAttemptsErr := bp.bundleOrm.UpdateBundleAttempts(ctx.Copy(), tmpBundleTask.Hash, tmpBundleTask.ActiveAttempts, tmpBundleTask.TotalAttempts)
+			if updateAttemptsErr != nil {
+				log.Error("failed to update bundle attempts", "height", getTaskParameter.ProverHeight, "err", updateAttemptsErr)
+				return nil, ErrCoordinatorInternalFailure
+			}
+
+			if rowsAffected == 0 {
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+		}
 		bundleTask = tmpBundleTask
 		break
 	}
@@ -109,48 +177,60 @@ func (bp *BundleProverTask) Assign(ctx *gin.Context, getTaskParameter *coordinat
 	}
 
 	log.Info("start bundle proof generation session", "task index", bundleTask.Index, "public key", taskCtx.PublicKey, "prover name", taskCtx.ProverName)
-
-	hardForkName, getHardForkErr := bp.hardForkName(ctx, bundleTask)
-	if getHardForkErr != nil {
-		bp.recoverActiveAttempts(ctx, bundleTask)
-		log.Error("retrieve hard fork name by bundle failed", "task_id", bundleTask.Hash, "err", getHardForkErr)
-		return nil, ErrCoordinatorInternalFailure
+	var proverTask *orm.ProverTask
+	if taskCtx.hasAssignedTask == nil {
+		proverTask = &orm.ProverTask{
+			TaskID:          bundleTask.Hash,
+			ProverPublicKey: taskCtx.PublicKey,
+			TaskType:        int16(message.ProofTypeBundle),
+			ProverName:      taskCtx.ProverName,
+			ProverVersion:   taskCtx.ProverVersion,
+			ProvingStatus:   int16(types.ProverAssigned),
+			FailureType:     int16(types.ProverTaskFailureTypeUndefined),
+			// here why need use UTC time. see scroll/common/database/db.go
+			AssignedAt: utils.NowUTC(),
+		}
+	} else {
+		proverTask = taskCtx.hasAssignedTask
 	}
 
-	//if _, ok := taskCtx.HardForkNames[hardForkName]; !ok {
-	//	bp.recoverActiveAttempts(ctx, bundleTask)
-	//	log.Error("incompatible prover version",
-	//		"requisite hard fork name", hardForkName,
-	//		"prover hard fork name", taskCtx.HardForkNames,
-	//		"task_id", bundleTask.Hash)
-	//	return nil, ErrCoordinatorInternalFailure
-	//}
-
-	proverTask := orm.ProverTask{
-		TaskID:          bundleTask.Hash,
-		ProverPublicKey: taskCtx.PublicKey,
-		TaskType:        int16(message.ProofTypeBundle),
-		ProverName:      taskCtx.ProverName,
-		ProverVersion:   taskCtx.ProverVersion,
-		ProvingStatus:   int16(types.ProverAssigned),
-		FailureType:     int16(types.ProverTaskFailureTypeUndefined),
-		// here why need use UTC time. see scroll/common/database/db.go
-		AssignedAt: utils.NowUTC(),
-	}
-
-	// Store session info.
-	if err = bp.proverTaskOrm.InsertProverTask(ctx.Copy(), &proverTask); err != nil {
-		bp.recoverActiveAttempts(ctx, bundleTask)
-		log.Error("insert bundle prover task info fail", "task_id", bundleTask.Hash, "publicKey", taskCtx.PublicKey, "err", err)
-		return nil, ErrCoordinatorInternalFailure
-	}
-
-	taskMsg, err := bp.formatProverTask(ctx.Copy(), &proverTask, hardForkName)
+	taskMsg, err := bp.formatProverTask(ctx.Copy(), proverTask, hardForkName)
 	if err != nil {
 		bp.recoverActiveAttempts(ctx, bundleTask)
 		log.Error("format bundle prover task failure", "task_id", bundleTask.Hash, "err", err)
 		return nil, ErrCoordinatorInternalFailure
 	}
+	if getTaskParameter.Universal {
+		var metadata []byte
+		taskMsg, metadata, err = bp.applyUniversal(taskMsg)
+		if err != nil {
+			bp.recoverActiveAttempts(ctx, bundleTask)
+			log.Error("Generate universal prover task failure", "task_id", bundleTask.Hash, "type", "bundle", "err", err)
+			return nil, ErrCoordinatorInternalFailure
+		}
+		// bundle proof require snark
+		taskMsg.UseSnark = true
+		proverTask.Metadata = metadata
+
+		if isCompatibilityFixingVersion(taskCtx.ProverVersion) {
+			log.Info("Apply compatibility fixing for prover", "version", taskCtx.ProverVersion)
+			if err := fixCompatibility(taskMsg); err != nil {
+				log.Error("apply compatibility failure", "err", err)
+				return nil, ErrCoordinatorInternalFailure
+			}
+		}
+	}
+
+	// Store session info.
+	if taskCtx.hasAssignedTask == nil {
+		if err = bp.proverTaskOrm.InsertProverTask(ctx.Copy(), proverTask); err != nil {
+			bp.recoverActiveAttempts(ctx, bundleTask)
+			log.Error("insert bundle prover task info fail", "task_id", bundleTask.Hash, "publicKey", taskCtx.PublicKey, "err", err)
+			return nil, ErrCoordinatorInternalFailure
+		}
+	}
+	// notice uuid is set as a side effect of InsertProverTask
+	taskMsg.UUID = proverTask.UUID.String()
 
 	bp.bundleTaskGetTaskTotal.WithLabelValues(hardForkName).Inc()
 	bp.bundleTaskGetTaskProver.With(prometheus.Labels{
@@ -160,26 +240,6 @@ func (bp *BundleProverTask) Assign(ctx *gin.Context, getTaskParameter *coordinat
 	}).Inc()
 
 	return taskMsg, nil
-}
-
-func (bp *BundleProverTask) hardForkName(ctx *gin.Context, bundleTask *orm.Bundle) (string, error) {
-	startBatch, getBatchErr := bp.batchOrm.GetBatchByHash(ctx, bundleTask.StartBatchHash)
-	if getBatchErr != nil {
-		return "", getBatchErr
-	}
-
-	startChunk, getChunkErr := bp.chunkOrm.GetChunkByHash(ctx, startBatch.StartChunkHash)
-	if getChunkErr != nil {
-		return "", getChunkErr
-	}
-
-	l2Block, getBlockErr := bp.blockOrm.GetL2BlockByNumber(ctx.Copy(), startChunk.StartBlockNumber)
-	if getBlockErr != nil {
-		return "", getBlockErr
-	}
-
-	hardForkName := forks.GetHardforkName(bp.chainCfg, l2Block.Number, l2Block.BlockTimestamp)
-	return hardForkName, nil
 }
 
 func (bp *BundleProverTask) formatProverTask(ctx context.Context, task *orm.ProverTask, hardForkName string) (*coordinatorType.GetTaskSchema, error) {
@@ -194,17 +254,46 @@ func (bp *BundleProverTask) formatProverTask(ctx context.Context, task *orm.Prov
 		return nil, fmt.Errorf("failed to get batch proofs for bundle task id:%s, no batch found", task.TaskID)
 	}
 
-	var batchProofs []*message.BatchProof
+	var prevStateRoot common.Hash
+	// this would be common in test cases: the first batch has empty parent
+	if batches[0].Index > 1 {
+		parentBatch, err := bp.batchOrm.GetBatchByHash(ctx, batches[0].ParentBatchHash)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get parent batch for batch task id:%s err:%w", task.TaskID, err)
+		}
+		prevStateRoot = common.HexToHash(parentBatch.StateRoot)
+	}
+
+	var batchProofs []*message.OpenVMBatchProof
 	for _, batch := range batches {
-		var proof message.BatchProof
+		var proof message.OpenVMBatchProof
 		if encodeErr := json.Unmarshal(batch.Proof, &proof); encodeErr != nil {
 			return nil, fmt.Errorf("failed to unmarshal proof: %w, bundle hash: %v, batch hash: %v", encodeErr, task.TaskID, batch.Hash)
 		}
 		batchProofs = append(batchProofs, &proof)
 	}
 
+	// Get the version byte.
+	version, err := bp.version(hardForkName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode version byte: %w", err)
+	}
+
 	taskDetail := message.BundleTaskDetail{
+		Version:     version,
 		BatchProofs: batchProofs,
+		ForkName:    hardForkName,
+	}
+
+	taskDetail.BundleInfo = &message.OpenVMBundleInfo{
+		ChainID:       bp.cfg.L2.ChainID,
+		PrevStateRoot: prevStateRoot,
+		PostStateRoot: common.HexToHash(batches[len(batches)-1].StateRoot),
+		WithdrawRoot:  common.HexToHash(batches[len(batches)-1].WithdrawRoot),
+		NumBatches:    uint32(len(batches)),
+		PrevBatchHash: common.HexToHash(batches[0].ParentBatchHash),
+		BatchHash:     common.HexToHash(batches[len(batches)-1].Hash),
+		MsgQueueHash:  common.HexToHash(batches[len(batches)-1].PostL1MessageQueueHash),
 	}
 
 	batchProofsBytes, err := json.Marshal(taskDetail)
@@ -213,12 +302,14 @@ func (bp *BundleProverTask) formatProverTask(ctx context.Context, task *orm.Prov
 	}
 
 	taskMsg := &coordinatorType.GetTaskSchema{
-		UUID:         task.UUID.String(),
 		TaskID:       task.TaskID,
 		TaskType:     int(message.ProofTypeBundle),
 		TaskData:     string(batchProofsBytes),
 		HardForkName: hardForkName,
 	}
+
+	log.Debug("TaskData", "task_id", task.TaskID, "task_type", message.ProofTypeBundle.String(), "hard_fork_name", hardForkName, "task_data", taskMsg.TaskData)
+
 	return taskMsg, nil
 }
 

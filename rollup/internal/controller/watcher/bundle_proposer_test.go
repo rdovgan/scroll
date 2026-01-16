@@ -2,6 +2,7 @@ package watcher
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"math/big"
 	"testing"
@@ -11,6 +12,8 @@ import (
 	gethTypes "github.com/scroll-tech/go-ethereum/core/types"
 	"github.com/scroll-tech/go-ethereum/params"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 
 	"scroll-tech/common/database"
 	"scroll-tech/common/types"
@@ -20,7 +23,7 @@ import (
 	"scroll-tech/rollup/internal/utils"
 )
 
-func testBundleProposerLimits(t *testing.T) {
+func testBundleProposerLimitsCodecV7(t *testing.T) {
 	tests := []struct {
 		name                         string
 		maxBatchNumPerBundle         uint64
@@ -66,13 +69,12 @@ func testBundleProposerLimits(t *testing.T) {
 				Header: &gethTypes.Header{
 					Number: big.NewInt(0),
 				},
-				RowConsumption: &gethTypes.RowConsumption{},
 			}
 			chunk := &encoding.Chunk{
 				Blocks: []*encoding.Block{block},
 			}
 			chunkOrm := orm.NewChunk(db)
-			_, err := chunkOrm.InsertChunk(context.Background(), chunk, utils.CodecConfig{Version: encoding.CodecV0}, utils.ChunkMetrics{})
+			_, err := chunkOrm.InsertChunk(context.Background(), chunk, encoding.CodecV0, utils.ChunkMetrics{})
 			assert.NoError(t, err)
 			batch := &encoding.Batch{
 				Index:                      0,
@@ -81,33 +83,31 @@ func testBundleProposerLimits(t *testing.T) {
 				Chunks:                     []*encoding.Chunk{chunk},
 			}
 			batchOrm := orm.NewBatch(db)
-			_, err = batchOrm.InsertBatch(context.Background(), batch, utils.CodecConfig{Version: encoding.CodecV0}, utils.BatchMetrics{})
+			_, err = batchOrm.InsertBatch(context.Background(), batch, encoding.CodecV0, utils.BatchMetrics{})
 			assert.NoError(t, err)
+
+			block3 := *block1
+			block3.Header = &gethTypes.Header{}
+			*block3.Header = *block1.Header
+			block3.Header.Number = new(big.Int).SetUint64(block2.Header.Number.Uint64() + 1)
 
 			l2BlockOrm := orm.NewL2Block(db)
-			err = l2BlockOrm.InsertL2Blocks(context.Background(), []*encoding.Block{block1, block2})
+			err = l2BlockOrm.InsertL2Blocks(context.Background(), []*encoding.Block{block1, block2, &block3})
 			assert.NoError(t, err)
 
-			chainConfig := &params.ChainConfig{BernoulliBlock: big.NewInt(0), CurieBlock: big.NewInt(0), DarwinTime: new(uint64)}
+			chainConfig := &params.ChainConfig{LondonBlock: big.NewInt(0), BernoulliBlock: big.NewInt(0), CurieBlock: big.NewInt(0), DarwinTime: new(uint64), DarwinV2Time: new(uint64), EuclidTime: new(uint64), EuclidV2Time: new(uint64)}
 
 			cp := NewChunkProposer(context.Background(), &config.ChunkProposerConfig{
-				MaxBlockNumPerChunk:             1,
-				MaxTxNumPerChunk:                math.MaxUint64,
-				MaxL1CommitGasPerChunk:          math.MaxUint64,
-				MaxL1CommitCalldataSizePerChunk: math.MaxUint64,
-				MaxRowConsumptionPerChunk:       math.MaxUint64,
-				ChunkTimeoutSec:                 math.MaxUint32,
-				GasCostIncreaseMultiplier:       1,
-				MaxUncompressedBatchBytesSize:   math.MaxUint64,
-			}, chainConfig, db, nil)
+				MaxL2GasPerChunk:              1152994, // One block per chunk via gas limit
+				ChunkTimeoutSec:               math.MaxUint32,
+				MaxUncompressedBatchBytesSize: math.MaxUint64,
+			}, encoding.CodecV7, chainConfig, db, nil)
 
 			bap := NewBatchProposer(context.Background(), &config.BatchProposerConfig{
-				MaxL1CommitGasPerBatch:          math.MaxUint64,
-				MaxL1CommitCalldataSizePerBatch: math.MaxUint64,
-				BatchTimeoutSec:                 0,
-				GasCostIncreaseMultiplier:       1,
-				MaxUncompressedBatchBytesSize:   math.MaxUint64,
-			}, chainConfig, db, nil)
+				MaxChunksPerBatch:             math.MaxInt32,
+				BatchTimeoutSec:               0,
+				MaxUncompressedBatchBytesSize: math.MaxUint64,
+			}, encoding.CodecV7, chainConfig, db, false /* rollup mode */, nil)
 
 			cp.TryProposeChunk()  // chunk1 contains block1
 			bap.TryProposeBatch() // batch1 contains chunk1
@@ -117,7 +117,25 @@ func testBundleProposerLimits(t *testing.T) {
 			bup := NewBundleProposer(context.Background(), &config.BundleProposerConfig{
 				MaxBatchNumPerBundle: tt.maxBatchNumPerBundle,
 				BundleTimeoutSec:     tt.bundleTimeoutSec,
-			}, chainConfig, db, nil)
+			}, encoding.CodecV7, chainConfig, db, nil)
+
+			batches, err := batchOrm.GetBatches(context.Background(), map[string]interface{}{}, []string{}, 0)
+			require.NoError(t, err)
+			require.Len(t, batches, 3) // genesis batch + batch1 + batch2
+			batches = batches[1:]      // remove genesis batch
+
+			// simulate batches 1 and 2 being submitted in separate transactions -> need it to be able to propose bundles
+			err = db.Transaction(func(dbTX *gorm.DB) error {
+				if err = batchOrm.UpdateCommitTxHashAndRollupStatus(context.Background(), batches[0].Hash, "0xdefdef", types.RollupCommitted, dbTX); err != nil {
+					return fmt.Errorf("UpdateCommitTxHashAndRollupStatus failed for batch %d: %s, err %v", batches[0].Index, batches[0].Hash, err)
+				}
+
+				if err = batchOrm.UpdateCommitTxHashAndRollupStatus(context.Background(), batches[1].Hash, "0xabcabc", types.RollupCommitted, dbTX); err != nil {
+					return fmt.Errorf("UpdateCommitTxHashAndRollupStatus failed for batch %d: %s, err %v", batches[1].Index, batches[1].Hash, err)
+				}
+				return nil
+			})
+			require.NoError(t, err)
 
 			bup.TryProposeBundle()
 
@@ -132,95 +150,5 @@ func testBundleProposerLimits(t *testing.T) {
 				assert.Equal(t, types.ProvingTaskUnassigned, types.ProvingStatus(bundles[0].ProvingStatus))
 			}
 		})
-	}
-}
-
-func testBundleProposerRespectHardforks(t *testing.T) {
-	db := setupDB(t)
-	defer database.CloseDB(db)
-
-	chainConfig := &params.ChainConfig{
-		BernoulliBlock: big.NewInt(1),
-		CurieBlock:     big.NewInt(2),
-		DarwinTime:     func() *uint64 { t := uint64(4); return &t }(),
-	}
-
-	// Add genesis batch.
-	block := &encoding.Block{
-		Header: &gethTypes.Header{
-			Number: big.NewInt(0),
-		},
-		RowConsumption: &gethTypes.RowConsumption{},
-	}
-	chunk := &encoding.Chunk{
-		Blocks: []*encoding.Block{block},
-	}
-	chunkOrm := orm.NewChunk(db)
-	_, err := chunkOrm.InsertChunk(context.Background(), chunk, utils.CodecConfig{Version: encoding.CodecV0}, utils.ChunkMetrics{})
-	assert.NoError(t, err)
-	batch := &encoding.Batch{
-		Index:                      0,
-		TotalL1MessagePoppedBefore: 0,
-		ParentBatchHash:            common.Hash{},
-		Chunks:                     []*encoding.Chunk{chunk},
-	}
-	batchOrm := orm.NewBatch(db)
-	_, err = batchOrm.InsertBatch(context.Background(), batch, utils.CodecConfig{Version: encoding.CodecV0}, utils.BatchMetrics{})
-	assert.NoError(t, err)
-
-	cp := NewChunkProposer(context.Background(), &config.ChunkProposerConfig{
-		MaxBlockNumPerChunk:             math.MaxUint64,
-		MaxTxNumPerChunk:                math.MaxUint64,
-		MaxL1CommitGasPerChunk:          math.MaxUint64,
-		MaxL1CommitCalldataSizePerChunk: math.MaxUint64,
-		MaxRowConsumptionPerChunk:       math.MaxUint64,
-		ChunkTimeoutSec:                 0,
-		GasCostIncreaseMultiplier:       1,
-		MaxUncompressedBatchBytesSize:   math.MaxUint64,
-	}, chainConfig, db, nil)
-
-	block = readBlockFromJSON(t, "../../../testdata/blockTrace_02.json")
-	for i := int64(1); i <= 60; i++ {
-		block.Header.Number = big.NewInt(i)
-		block.Header.Time = uint64(i)
-		err = orm.NewL2Block(db).InsertL2Blocks(context.Background(), []*encoding.Block{block})
-		assert.NoError(t, err)
-	}
-
-	for i := 0; i < 5; i++ {
-		cp.TryProposeChunk()
-	}
-
-	bap := NewBatchProposer(context.Background(), &config.BatchProposerConfig{
-		MaxL1CommitGasPerBatch:          math.MaxUint64,
-		MaxL1CommitCalldataSizePerBatch: math.MaxUint64,
-		BatchTimeoutSec:                 0,
-		GasCostIncreaseMultiplier:       1,
-		MaxUncompressedBatchBytesSize:   math.MaxUint64,
-	}, chainConfig, db, nil)
-
-	for i := 0; i < 5; i++ {
-		bap.TryProposeBatch()
-	}
-
-	bup := NewBundleProposer(context.Background(), &config.BundleProposerConfig{
-		MaxBatchNumPerBundle: math.MaxUint64,
-		BundleTimeoutSec:     0,
-	}, chainConfig, db, nil)
-
-	for i := 0; i < 5; i++ {
-		bup.TryProposeBundle()
-	}
-
-	bundleOrm := orm.NewBundle(db)
-	bundles, err := bundleOrm.GetBundles(context.Background(), map[string]interface{}{}, []string{}, 0)
-	assert.NoError(t, err)
-	assert.Len(t, bundles, 1)
-
-	expectedStartBatchIndices := []uint64{3}
-	expectedEndChunkIndices := []uint64{3}
-	for i, bundle := range bundles {
-		assert.Equal(t, expectedStartBatchIndices[i], bundle.StartBatchIndex)
-		assert.Equal(t, expectedEndChunkIndices[i], bundle.EndBatchIndex)
 	}
 }

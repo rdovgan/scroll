@@ -2,6 +2,7 @@ package orm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -84,7 +85,7 @@ func (c *CrossMessage) GetMessageSyncedHeightInDB(ctx context.Context, messageTy
 		db = db.Order("l2_block_number desc")
 	}
 	if err := db.First(&message).Error; err != nil {
-		if err == gorm.ErrRecordNotFound {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return 0, nil
 		}
 		return 0, fmt.Errorf("failed to get latest processed height, type: %v, error: %w", messageType, err)
@@ -108,7 +109,7 @@ func (c *CrossMessage) GetL2LatestFinalizedWithdrawal(ctx context.Context) (*Cro
 	db = db.Where("rollup_status = ?", btypes.RollupStatusTypeFinalized)
 	db = db.Order("message_nonce desc")
 	if err := db.First(&message).Error; err != nil {
-		if err == gorm.ErrRecordNotFound {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("failed to get latest L2 finalized sent message event, error: %w", err)
@@ -127,10 +128,10 @@ func (c *CrossMessage) GetL2WithdrawalsByBlockRange(ctx context.Context, startBl
 	db = db.Where("message_type = ?", btypes.MessageTypeL2SentMessage)
 	db = db.Order("message_nonce asc")
 	if err := db.Find(&messages).Error; err != nil {
-		if err == gorm.ErrRecordNotFound {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, nil
 		}
-		return nil, fmt.Errorf("failed to get latest L2 finalized sent message event, error: %w", err)
+		return nil, fmt.Errorf("failed to get L2 withdrawals by block range, error: %v", err)
 	}
 	return messages, nil
 }
@@ -153,10 +154,10 @@ func (c *CrossMessage) GetL2UnclaimedWithdrawalsByAddress(ctx context.Context, s
 	db := c.db.WithContext(ctx)
 	db = db.Model(&CrossMessage{})
 	db = db.Where("message_type = ?", btypes.MessageTypeL2SentMessage)
-	db = db.Where("tx_status = ?", types.TxStatusTypeSent)
+	db = db.Where("tx_status in (?)", []types.TxStatusType{types.TxStatusTypeSent, types.TxStatusTypeFailedRelayed, types.TxStatusTypeRelayTxReverted})
 	db = db.Where("sender = ?", sender)
 	db = db.Order("block_timestamp desc")
-	db = db.Limit(500)
+	db = db.Limit(10000)
 	if err := db.Find(&messages).Error; err != nil {
 		return nil, fmt.Errorf("failed to get L2 claimable withdrawal messages by sender address, sender: %v, error: %w", sender, err)
 	}

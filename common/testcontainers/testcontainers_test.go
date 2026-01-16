@@ -3,7 +3,6 @@ package testcontainers
 import (
 	"testing"
 
-	"github.com/scroll-tech/go-ethereum/ethclient"
 	"github.com/stretchr/testify/assert"
 	"gorm.io/gorm"
 )
@@ -14,7 +13,6 @@ func TestNewTestcontainerApps(t *testing.T) {
 		err          error
 		endpoint     string
 		gormDBclient *gorm.DB
-		ethclient    *ethclient.Client
 	)
 
 	testApps := NewTestcontainerApps()
@@ -32,17 +30,22 @@ func TestNewTestcontainerApps(t *testing.T) {
 	endpoint, err = testApps.GetL2GethEndPoint()
 	assert.NoError(t, err)
 	assert.NotEmpty(t, endpoint)
-	ethclient, err = testApps.GetL2GethClient()
+	l2RawClient, err := testApps.GetL2Client()
 	assert.NoError(t, err)
-	assert.NotNil(t, ethclient)
+	assert.NotNil(t, l2RawClient)
 
 	assert.NoError(t, testApps.StartPoSL1Container())
 	endpoint, err = testApps.GetPoSL1EndPoint()
 	assert.NoError(t, err)
 	assert.NotEmpty(t, endpoint)
-	ethclient, err = testApps.GetPoSL1Client()
+	l1RawClient, err := testApps.GetPoSL1Client()
 	assert.NoError(t, err)
-	assert.NotNil(t, ethclient)
+	assert.NotNil(t, l1RawClient)
+
+	assert.NoError(t, testApps.StartWeb3SignerContainer(1))
+	endpoint, err = testApps.GetWeb3SignerEndpoint()
+	assert.NoError(t, err)
+	assert.NotEmpty(t, endpoint)
 
 	// test free testcontainers
 	testApps.Free()
@@ -56,5 +59,9 @@ func TestNewTestcontainerApps(t *testing.T) {
 
 	endpoint, err = testApps.GetPoSL1EndPoint()
 	assert.EqualError(t, err, "PoS L1 container is not running")
+	assert.Empty(t, endpoint)
+
+	endpoint, err = testApps.GetWeb3SignerEndpoint()
+	assert.EqualError(t, err, "web3signer is not running")
 	assert.Empty(t, endpoint)
 }

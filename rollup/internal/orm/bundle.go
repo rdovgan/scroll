@@ -59,18 +59,18 @@ func (*Bundle) TableName() string {
 	return "bundle"
 }
 
-// getLatestBundle retrieves the latest bundle from the database.
-func (o *Bundle) getLatestBundle(ctx context.Context) (*Bundle, error) {
+// GetLatestBundle retrieves the latest bundle from the database.
+func (o *Bundle) GetLatestBundle(ctx context.Context) (*Bundle, error) {
 	db := o.db.WithContext(ctx)
 	db = db.Model(&Bundle{})
 	db = db.Order("index desc")
 
 	var latestBundle Bundle
 	if err := db.First(&latestBundle).Error; err != nil {
-		if err == gorm.ErrRecordNotFound {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, nil
 		}
-		return nil, fmt.Errorf("getLatestBundle error: %w", err)
+		return nil, fmt.Errorf("GetLatestBundle error: %w", err)
 	}
 	return &latestBundle, nil
 }
@@ -106,7 +106,7 @@ func (o *Bundle) GetBundles(ctx context.Context, fields map[string]interface{}, 
 // GetFirstUnbundledBatchIndex retrieves the first unbundled batch index.
 func (o *Bundle) GetFirstUnbundledBatchIndex(ctx context.Context) (uint64, error) {
 	// Get the latest bundle
-	latestBundle, err := o.getLatestBundle(ctx)
+	latestBundle, err := o.GetLatestBundle(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("Bundle.GetFirstUnbundledBatchIndex error: %w", err)
 	}
@@ -134,7 +134,7 @@ func (o *Bundle) GetFirstPendingBundle(ctx context.Context) (*Bundle, error) {
 }
 
 // GetVerifiedProofByHash retrieves the verified aggregate proof for a bundle with the given hash.
-func (o *Bundle) GetVerifiedProofByHash(ctx context.Context, hash string) (*message.BundleProof, error) {
+func (o *Bundle) GetVerifiedProofByHash(ctx context.Context, hash string) (*message.OpenVMBundleProof, error) {
 	db := o.db.WithContext(ctx)
 	db = db.Model(&Bundle{})
 	db = db.Select("proof")
@@ -145,7 +145,7 @@ func (o *Bundle) GetVerifiedProofByHash(ctx context.Context, hash string) (*mess
 		return nil, fmt.Errorf("Bundle.GetVerifiedProofByHash error: %w, bundle hash: %v", err, hash)
 	}
 
-	var proof message.BundleProof
+	var proof message.OpenVMBundleProof
 	if err := json.Unmarshal(bundle.Proof, &proof); err != nil {
 		return nil, fmt.Errorf("Bundle.GetVerifiedProofByHash error: %w, bundle hash: %v", err, hash)
 	}
@@ -189,15 +189,19 @@ func (o *Bundle) InsertBundle(ctx context.Context, batches []*Batch, codecVersio
 }
 
 // UpdateFinalizeTxHashAndRollupStatus updates the finalize transaction hash and rollup status for a bundle.
-func (o *Bundle) UpdateFinalizeTxHashAndRollupStatus(ctx context.Context, hash string, finalizeTxHash string, status types.RollupStatus) error {
+func (o *Bundle) UpdateFinalizeTxHashAndRollupStatus(ctx context.Context, hash string, finalizeTxHash string, status types.RollupStatus, dbTX ...*gorm.DB) error {
 	updateFields := make(map[string]interface{})
 	updateFields["finalize_tx_hash"] = finalizeTxHash
 	updateFields["rollup_status"] = int(status)
 	if status == types.RollupFinalized {
-		updateFields["finalized_at"] = time.Now()
+		updateFields["finalized_at"] = utils.NowUTC()
 	}
 
-	db := o.db.WithContext(ctx)
+	db := o.db
+	if len(dbTX) > 0 && dbTX[0] != nil {
+		db = dbTX[0]
+	}
+	db = db.WithContext(ctx)
 	db = db.Model(&Bundle{})
 	db = db.Where("hash", hash)
 
@@ -214,7 +218,7 @@ func (o *Bundle) UpdateProvingStatus(ctx context.Context, hash string, status ty
 
 	switch status {
 	case types.ProvingTaskVerified:
-		updateFields["proved_at"] = time.Now()
+		updateFields["proved_at"] = utils.NowUTC()
 	}
 
 	db := o.db
@@ -233,14 +237,18 @@ func (o *Bundle) UpdateProvingStatus(ctx context.Context, hash string, status ty
 
 // UpdateRollupStatus updates the rollup status for a bundle.
 // only used in unit tests.
-func (o *Bundle) UpdateRollupStatus(ctx context.Context, hash string, status types.RollupStatus) error {
+func (o *Bundle) UpdateRollupStatus(ctx context.Context, hash string, status types.RollupStatus, dbTX ...*gorm.DB) error {
 	updateFields := make(map[string]interface{})
 	updateFields["rollup_status"] = int(status)
 	if status == types.RollupFinalized {
-		updateFields["finalized_at"] = time.Now()
+		updateFields["finalized_at"] = utils.NowUTC()
 	}
 
-	db := o.db.WithContext(ctx)
+	db := o.db
+	if len(dbTX) > 0 && dbTX[0] != nil {
+		db = dbTX[0]
+	}
+	db = db.WithContext(ctx)
 	db = db.Model(&Bundle{})
 	db = db.Where("hash", hash)
 
@@ -252,7 +260,7 @@ func (o *Bundle) UpdateRollupStatus(ctx context.Context, hash string, status typ
 
 // UpdateProofAndProvingStatusByHash updates the bundle proof and proving status by hash.
 // only used in unit tests.
-func (o *Bundle) UpdateProofAndProvingStatusByHash(ctx context.Context, hash string, proof *message.BundleProof, provingStatus types.ProvingStatus, proofTimeSec uint64, dbTX ...*gorm.DB) error {
+func (o *Bundle) UpdateProofAndProvingStatusByHash(ctx context.Context, hash string, proof *message.OpenVMBundleProof, provingStatus types.ProvingStatus, proofTimeSec uint64, dbTX ...*gorm.DB) error {
 	db := o.db
 	if len(dbTX) > 0 && dbTX[0] != nil {
 		db = dbTX[0]

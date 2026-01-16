@@ -1,6 +1,7 @@
 package provertask
 
 import (
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
@@ -9,12 +10,18 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/scroll-tech/da-codec/encoding"
 	"github.com/scroll-tech/go-ethereum/params"
 	"gorm.io/gorm"
 
+	"scroll-tech/common/types/message"
+	"scroll-tech/common/version"
+
 	"scroll-tech/coordinator/internal/config"
+	"scroll-tech/coordinator/internal/logic/libzkp"
 	"scroll-tech/coordinator/internal/orm"
 	coordinatorType "scroll-tech/coordinator/internal/types"
+	"scroll-tech/coordinator/internal/utils"
 )
 
 var (
@@ -34,9 +41,10 @@ type ProverTask interface {
 
 // BaseProverTask a base prover task which contain series functions
 type BaseProverTask struct {
-	cfg      *config.Config
-	chainCfg *params.ChainConfig
-	db       *gorm.DB
+	cfg        *config.Config
+	chainCfg   *params.ChainConfig
+	db         *gorm.DB
+	expectedVk map[string][]byte
 
 	batchOrm           *orm.Batch
 	chunkOrm           *orm.Chunk
@@ -47,10 +55,93 @@ type BaseProverTask struct {
 }
 
 type proverTaskContext struct {
-	PublicKey     string
-	ProverName    string
-	ProverVersion string
-	HardForkNames map[string]struct{}
+	PublicKey          string
+	ProverName         string
+	ProverVersion      string
+	ProverProviderType uint8
+	HardForkNames      map[string]struct{}
+
+	taskType        message.ProofType
+	chunkTask       *orm.Chunk
+	batchTask       *orm.Batch
+	bundleTask      *orm.Bundle
+	hasAssignedTask *orm.ProverTask
+}
+
+func (b *BaseProverTask) version(hardForkName string) (uint8, error) {
+	return utils.Version(hardForkName, b.validiumMode())
+}
+
+// validiumMode induce different behavior in task generation:
+// + skip the point_evaluation part in batch task
+// + encode batch header with codec in utils instead of da-codec
+func (b *BaseProverTask) validiumMode() bool {
+	return b.cfg.L2.ValidiumMode
+}
+
+// hardForkName get the chunk/batch/bundle hard fork name
+func (b *BaseProverTask) hardForkName(ctx *gin.Context, taskCtx *proverTaskContext) (string, error) {
+	switch {
+	case taskCtx.taskType == message.ProofTypeChunk:
+		if taskCtx.chunkTask == nil {
+			return "", errors.New("chunk task is nil")
+		}
+		l2Block, getBlockErr := b.blockOrm.GetL2BlockByNumber(ctx.Copy(), taskCtx.chunkTask.StartBlockNumber)
+		if getBlockErr != nil {
+			return "", getBlockErr
+		}
+		hardForkName := encoding.GetHardforkName(b.chainCfg, l2Block.Number, l2Block.BlockTimestamp)
+		return hardForkName, nil
+
+	case taskCtx.taskType == message.ProofTypeBatch:
+		if taskCtx.batchTask == nil {
+			return "", errors.New("batch task is nil")
+		}
+		startChunk, getChunkErr := b.chunkOrm.GetChunkByHash(ctx, taskCtx.batchTask.StartChunkHash)
+		if getChunkErr != nil {
+			return "", getChunkErr
+		}
+		l2Block, getBlockErr := b.blockOrm.GetL2BlockByNumber(ctx.Copy(), startChunk.StartBlockNumber)
+		if getBlockErr != nil {
+			return "", getBlockErr
+		}
+		hardForkName := encoding.GetHardforkName(b.chainCfg, l2Block.Number, l2Block.BlockTimestamp)
+		return hardForkName, nil
+
+	case taskCtx.taskType == message.ProofTypeBundle:
+		if taskCtx.bundleTask == nil {
+			return "", errors.New("bundle task is nil")
+		}
+		startBatch, getBatchErr := b.batchOrm.GetBatchByHash(ctx, taskCtx.bundleTask.StartBatchHash)
+		if getBatchErr != nil {
+			return "", getBatchErr
+		}
+		startChunk, getChunkErr := b.chunkOrm.GetChunkByHash(ctx, startBatch.StartChunkHash)
+		if getChunkErr != nil {
+			return "", getChunkErr
+		}
+		l2Block, getBlockErr := b.blockOrm.GetL2BlockByNumber(ctx.Copy(), startChunk.StartBlockNumber)
+		if getBlockErr != nil {
+			return "", getBlockErr
+		}
+		hardForkName := encoding.GetHardforkName(b.chainCfg, l2Block.Number, l2Block.BlockTimestamp)
+		return hardForkName, nil
+	default:
+		return "", errors.New("illegal task type")
+	}
+}
+
+// hardForkSanityCheck check the task's hard fork name is the same as prover
+func (b *BaseProverTask) hardForkSanityCheck(ctx *gin.Context, taskCtx *proverTaskContext) (string, error) {
+	hardForkName, getHardForkErr := b.hardForkName(ctx, taskCtx)
+	if getHardForkErr != nil {
+		return "", getHardForkErr
+	}
+
+	if _, ok := taskCtx.HardForkNames[hardForkName]; !ok {
+		return "", fmt.Errorf("to be assigned prover task's hard-fork name is not the same as prover, proverName: %s, proverVersion: %s, proverSupportHardForkNames: %s, taskHardForkName: %v", taskCtx.ProverName, taskCtx.ProverVersion, taskCtx.HardForkNames, hardForkName)
+	}
+	return hardForkName, nil
 }
 
 // checkParameter check the prover task parameter illegal
@@ -76,6 +167,13 @@ func (b *BaseProverTask) checkParameter(ctx *gin.Context) (*proverTaskContext, e
 	}
 	ptc.ProverVersion = proverVersion.(string)
 
+	ProverProviderType, ProverProviderTypeExist := ctx.Get(coordinatorType.ProverProviderTypeKey)
+	if !ProverProviderTypeExist {
+		// for backward compatibility, set ProverProviderType as internal
+		ProverProviderType = float64(coordinatorType.ProverProviderTypeInternal)
+	}
+	ptc.ProverProviderType = uint8(ProverProviderType.(float64))
+
 	hardForkNamesStr, hardForkNameExist := ctx.Get(coordinatorType.HardForkName)
 	if !hardForkNameExist {
 		return nil, errors.New("get hard fork name from context failed")
@@ -93,15 +191,54 @@ func (b *BaseProverTask) checkParameter(ctx *gin.Context) (*proverTaskContext, e
 		return nil, fmt.Errorf("public key %s is blocked from fetching tasks. ProverName: %s, ProverVersion: %s", publicKey, proverName, proverVersion)
 	}
 
-	isAssigned, err := b.proverTaskOrm.IsProverAssigned(ctx.Copy(), publicKey.(string))
+	assigned, err := b.proverTaskOrm.IsProverAssigned(ctx.Copy(), publicKey.(string))
 	if err != nil {
 		return nil, fmt.Errorf("failed to check if prover %s is assigned a task, err: %w", publicKey.(string), err)
 	}
 
-	if isAssigned {
-		return nil, fmt.Errorf("prover with publicKey %s is already assigned a task. ProverName: %s, ProverVersion: %s", publicKey, proverName, proverVersion)
-	}
+	ptc.hasAssignedTask = assigned
 	return &ptc, nil
+}
+
+func (b *BaseProverTask) applyUniversal(schema *coordinatorType.GetTaskSchema) (*coordinatorType.GetTaskSchema, []byte, error) {
+	expectedVk, ok := b.expectedVk[schema.HardForkName]
+	if !ok {
+		return nil, nil, fmt.Errorf("no expectedVk found from hardfork %s", schema.HardForkName)
+	}
+
+	var decryptionKey []byte
+	if b.cfg.L2.ValidiumMode {
+		var err error
+		decryptionKey, err = hex.DecodeString(b.cfg.Sequencer.DecryptionKey)
+		if err != nil {
+			return nil, nil, fmt.Errorf("sequencer decryption key hex-decoding failed")
+		}
+	}
+
+	ok, uTaskData, metadata, _ := libzkp.GenerateUniversalTask(schema.TaskType, schema.TaskData, schema.HardForkName, expectedVk, decryptionKey)
+	if !ok {
+		return nil, nil, fmt.Errorf("can not generate universal task, see coordinator log for the reason")
+	}
+
+	schema.TaskData = uTaskData
+	return schema, []byte(metadata), nil
+}
+
+const CompatibilityVersion = "4.5.43"
+
+func isCompatibilityFixingVersion(ver string) bool {
+	return !version.CheckScrollRepoVersion(ver, CompatibilityVersion)
+}
+
+func fixCompatibility(schema *coordinatorType.GetTaskSchema) error {
+
+	fixedTask, err := libzkp.UniversalTaskCompatibilityFix(schema.TaskData)
+	if err != nil {
+		return err
+	}
+	schema.TaskData = fixedTask
+
+	return nil
 }
 
 func newGetTaskCounterVec(factory promauto.Factory, taskType string) *prometheus.CounterVec {

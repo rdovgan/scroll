@@ -8,11 +8,10 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/scroll-tech/da-codec/encoding"
+	"github.com/scroll-tech/go-ethereum/common"
 	"github.com/scroll-tech/go-ethereum/log"
 	"github.com/scroll-tech/go-ethereum/params"
 	"gorm.io/gorm"
-
-	"scroll-tech/common/forks"
 
 	"scroll-tech/rollup/internal/config"
 	"scroll-tech/rollup/internal/orm"
@@ -27,64 +26,47 @@ type ChunkProposer struct {
 	chunkOrm   *orm.Chunk
 	l2BlockOrm *orm.L2Block
 
-	maxBlockNumPerChunk             uint64
-	maxTxNumPerChunk                uint64
-	maxL1CommitGasPerChunk          uint64
-	maxL1CommitCalldataSizePerChunk uint64
-	maxRowConsumptionPerChunk       uint64
-	chunkTimeoutSec                 uint64
-	gasCostIncreaseMultiplier       float64
-	maxUncompressedBatchBytesSize   uint64
+	cfg *config.ChunkProposerConfig
 
-	chainCfg *params.ChainConfig
+	replayMode      bool
+	minCodecVersion encoding.CodecVersion
+	chainCfg        *params.ChainConfig
 
 	chunkProposerCircleTotal           prometheus.Counter
 	proposeChunkFailureTotal           prometheus.Counter
 	proposeChunkUpdateInfoTotal        prometheus.Counter
 	proposeChunkUpdateInfoFailureTotal prometheus.Counter
 	chunkTxNum                         prometheus.Gauge
-	chunkEstimateL1CommitGas           prometheus.Gauge
-	totalL1CommitCalldataSize          prometheus.Gauge
+	chunkL2Gas                         prometheus.Gauge
 	totalL1CommitBlobSize              prometheus.Gauge
-	maxTxConsumption                   prometheus.Gauge
 	chunkBlocksNum                     prometheus.Gauge
 	chunkFirstBlockTimeoutReached      prometheus.Counter
 	chunkBlocksProposeNotEnoughTotal   prometheus.Counter
-	chunkEstimateGasTime               prometheus.Gauge
-	chunkEstimateCalldataSizeTime      prometheus.Gauge
 	chunkEstimateBlobSizeTime          prometheus.Gauge
 
 	// total number of times that chunk proposer stops early due to compressed data compatibility breach
 	compressedDataCompatibilityBreachTotal prometheus.Counter
+
+	chunkProposeBlockHeight prometheus.Gauge
+	chunkProposeThroughput  prometheus.Counter
 }
 
 // NewChunkProposer creates a new ChunkProposer instance.
-func NewChunkProposer(ctx context.Context, cfg *config.ChunkProposerConfig, chainCfg *params.ChainConfig, db *gorm.DB, reg prometheus.Registerer) *ChunkProposer {
+func NewChunkProposer(ctx context.Context, cfg *config.ChunkProposerConfig, minCodecVersion encoding.CodecVersion, chainCfg *params.ChainConfig, db *gorm.DB, reg prometheus.Registerer) *ChunkProposer {
 	log.Info("new chunk proposer",
-		"maxBlockNumPerChunk", cfg.MaxBlockNumPerChunk,
-		"maxTxNumPerChunk", cfg.MaxTxNumPerChunk,
-		"maxL1CommitGasPerChunk", cfg.MaxL1CommitGasPerChunk,
-		"maxL1CommitCalldataSizePerChunk", cfg.MaxL1CommitCalldataSizePerChunk,
-		"maxRowConsumptionPerChunk", cfg.MaxRowConsumptionPerChunk,
+		"maxL2GasPerChunk", cfg.MaxL2GasPerChunk,
 		"chunkTimeoutSec", cfg.ChunkTimeoutSec,
-		"gasCostIncreaseMultiplier", cfg.GasCostIncreaseMultiplier,
-		"maxBlobSize", maxBlobSize,
-		"maxUncompressedBatchBytesSize", cfg.MaxUncompressedBatchBytesSize)
+		"maxBlobSize", maxBlobSize)
 
 	p := &ChunkProposer{
-		ctx:                             ctx,
-		db:                              db,
-		chunkOrm:                        orm.NewChunk(db),
-		l2BlockOrm:                      orm.NewL2Block(db),
-		maxBlockNumPerChunk:             cfg.MaxBlockNumPerChunk,
-		maxTxNumPerChunk:                cfg.MaxTxNumPerChunk,
-		maxL1CommitGasPerChunk:          cfg.MaxL1CommitGasPerChunk,
-		maxL1CommitCalldataSizePerChunk: cfg.MaxL1CommitCalldataSizePerChunk,
-		maxRowConsumptionPerChunk:       cfg.MaxRowConsumptionPerChunk,
-		chunkTimeoutSec:                 cfg.ChunkTimeoutSec,
-		gasCostIncreaseMultiplier:       cfg.GasCostIncreaseMultiplier,
-		maxUncompressedBatchBytesSize:   cfg.MaxUncompressedBatchBytesSize,
-		chainCfg:                        chainCfg,
+		ctx:             ctx,
+		db:              db,
+		chunkOrm:        orm.NewChunk(db),
+		l2BlockOrm:      orm.NewL2Block(db),
+		cfg:             cfg,
+		replayMode:      false,
+		minCodecVersion: minCodecVersion,
+		chainCfg:        chainCfg,
 
 		chunkProposerCircleTotal: promauto.With(reg).NewCounter(prometheus.CounterOpts{
 			Name: "rollup_propose_chunk_circle_total",
@@ -110,22 +92,15 @@ func NewChunkProposer(ctx context.Context, cfg *config.ChunkProposerConfig, chai
 			Name: "rollup_propose_chunk_tx_num",
 			Help: "The chunk tx num",
 		}),
-		chunkEstimateL1CommitGas: promauto.With(reg).NewGauge(prometheus.GaugeOpts{
-			Name: "rollup_propose_chunk_estimate_l1_commit_gas",
-			Help: "The chunk estimate l1 commit gas",
-		}),
-		totalL1CommitCalldataSize: promauto.With(reg).NewGauge(prometheus.GaugeOpts{
-			Name: "rollup_propose_chunk_total_l1_commit_call_data_size",
-			Help: "The total l1 commit call data size",
+		chunkL2Gas: promauto.With(reg).NewGauge(prometheus.GaugeOpts{
+			Name: "rollup_propose_chunk_l2_gas",
+			Help: "The chunk l2 gas",
 		}),
 		totalL1CommitBlobSize: promauto.With(reg).NewGauge(prometheus.GaugeOpts{
 			Name: "rollup_propose_chunk_total_l1_commit_blob_size",
 			Help: "The total l1 commit blob size",
 		}),
-		maxTxConsumption: promauto.With(reg).NewGauge(prometheus.GaugeOpts{
-			Name: "rollup_propose_chunk_max_tx_consumption",
-			Help: "The max tx consumption",
-		}),
+
 		chunkBlocksNum: promauto.With(reg).NewGauge(prometheus.GaugeOpts{
 			Name: "rollup_propose_chunk_chunk_block_number",
 			Help: "The number of blocks in the chunk",
@@ -138,27 +113,35 @@ func NewChunkProposer(ctx context.Context, cfg *config.ChunkProposerConfig, chai
 			Name: "rollup_propose_chunk_blocks_propose_not_enough_total",
 			Help: "Total number of chunk block propose not enough",
 		}),
-		chunkEstimateGasTime: promauto.With(reg).NewGauge(prometheus.GaugeOpts{
-			Name: "rollup_propose_chunk_estimate_gas_time",
-			Help: "Time taken to estimate gas for the chunk.",
-		}),
-		chunkEstimateCalldataSizeTime: promauto.With(reg).NewGauge(prometheus.GaugeOpts{
-			Name: "rollup_propose_chunk_estimate_calldata_size_time",
-			Help: "Time taken to estimate calldata size for the chunk.",
-		}),
 		chunkEstimateBlobSizeTime: promauto.With(reg).NewGauge(prometheus.GaugeOpts{
 			Name: "rollup_propose_chunk_estimate_blob_size_time",
 			Help: "Time taken to estimate blob size for the chunk.",
+		}),
+		chunkProposeBlockHeight: promauto.With(reg).NewGauge(prometheus.GaugeOpts{
+			Name: "rollup_chunk_propose_block_height",
+			Help: "The block height of the latest proposed chunk",
+		}),
+		chunkProposeThroughput: promauto.With(reg).NewCounter(prometheus.CounterOpts{
+			Name: "rollup_chunk_propose_throughput",
+			Help: "The total gas used in proposed chunks",
 		}),
 	}
 
 	return p
 }
 
+// SetReplayDB sets the replay database for the ChunkProposer.
+// This is used for the proposer tool only, to change the l2_block data source.
+// This function is not thread-safe and should be called after initializing the ChunkProposer and before starting to propose chunks.
+func (p *ChunkProposer) SetReplayDB(replayDB *gorm.DB) {
+	p.l2BlockOrm = orm.NewL2Block(replayDB)
+	p.replayMode = true
+}
+
 // TryProposeChunk tries to propose a new chunk.
 func (p *ChunkProposer) TryProposeChunk() {
 	p.chunkProposerCircleTotal.Inc()
-	if err := p.proposeChunk(); err != nil {
+	if err := p.ProposeChunk(); err != nil {
 		p.proposeChunkFailureTotal.Inc()
 		log.Error("propose new chunk failed", "err", err)
 		return
@@ -166,18 +149,14 @@ func (p *ChunkProposer) TryProposeChunk() {
 }
 
 func (p *ChunkProposer) updateDBChunkInfo(chunk *encoding.Chunk, codecVersion encoding.CodecVersion, metrics *utils.ChunkMetrics) error {
-	if chunk == nil {
+	if chunk == nil || len(chunk.Blocks) == 0 {
 		return nil
 	}
 
 	compatibilityBreachOccurred := false
-	codecConfig := utils.CodecConfig{
-		Version:        codecVersion,
-		EnableCompress: true,
-	}
 
 	for {
-		compatible, err := utils.CheckChunkCompressedDataCompatibility(chunk, codecVersion)
+		compatible, err := encoding.CheckChunkCompressedDataCompatibility(chunk, codecVersion)
 		if err != nil {
 			log.Error("Failed to check chunk compressed data compatibility", "start block number", chunk.Blocks[0].Header.Number, "codecVersion", codecVersion, "err", err)
 			return err
@@ -191,11 +170,15 @@ func (p *ChunkProposer) updateDBChunkInfo(chunk *encoding.Chunk, codecVersion en
 
 		if len(chunk.Blocks) == 1 {
 			log.Warn("Disable compression: cannot truncate chunk with only 1 block for compatibility", "block number", chunk.Blocks[0].Header.Number)
-			codecConfig.EnableCompress = false
 			break
 		}
 
 		chunk.Blocks = chunk.Blocks[:len(chunk.Blocks)-1]
+		chunk.PostL1MessageQueueHash, err = encoding.MessageQueueV2ApplyL1MessagesFromBlocks(chunk.PrevL1MessageQueueHash, chunk.Blocks)
+		if err != nil {
+			log.Error("Failed to calculate last L1 message queue hash for block", "block number", chunk.Blocks[0].Header.Number, "err", err)
+			return err
+		}
 
 		log.Info("Chunk not compatible with compressed data, removing last block", "start block number", chunk.Blocks[0].Header.Number, "truncated block length", len(chunk.Blocks))
 	}
@@ -205,7 +188,7 @@ func (p *ChunkProposer) updateDBChunkInfo(chunk *encoding.Chunk, codecVersion en
 
 		// recalculate chunk metrics after truncation
 		var calcErr error
-		metrics, calcErr = utils.CalculateChunkMetrics(chunk, codecConfig)
+		metrics, calcErr = utils.CalculateChunkMetrics(chunk, codecVersion)
 		if calcErr != nil {
 			return fmt.Errorf("failed to calculate chunk metrics, start block number: %v, error: %w", chunk.Blocks[0].Header.Number, calcErr)
 		}
@@ -214,16 +197,22 @@ func (p *ChunkProposer) updateDBChunkInfo(chunk *encoding.Chunk, codecVersion en
 		p.recordAllChunkMetrics(metrics)
 	}
 
+	p.chunkProposeBlockHeight.Set(float64(chunk.Blocks[len(chunk.Blocks)-1].Header.Number.Uint64()))
+	p.chunkProposeThroughput.Add(float64(chunk.TotalGasUsed()))
+
 	p.proposeChunkUpdateInfoTotal.Inc()
 	err := p.db.Transaction(func(dbTX *gorm.DB) error {
-		dbChunk, err := p.chunkOrm.InsertChunk(p.ctx, chunk, codecConfig, *metrics, dbTX)
+		dbChunk, err := p.chunkOrm.InsertChunk(p.ctx, chunk, codecVersion, *metrics, dbTX)
 		if err != nil {
-			log.Warn("ChunkProposer.InsertChunk failed", "codec version", codecVersion, "enable compress", codecConfig.EnableCompress, "err", err)
+			log.Warn("ChunkProposer.InsertChunk failed", "codec version", codecVersion, "err", err)
 			return err
 		}
-		if err := p.l2BlockOrm.UpdateChunkHashInRange(p.ctx, dbChunk.StartBlockNumber, dbChunk.EndBlockNumber, dbChunk.Hash, dbTX); err != nil {
-			log.Error("failed to update chunk_hash for l2_blocks", "chunk hash", dbChunk.Hash, "start block", dbChunk.StartBlockNumber, "end block", dbChunk.EndBlockNumber, "err", err)
-			return err
+		// In replayMode we don't need to update chunk_hash in l2_block table.
+		if !p.replayMode {
+			if err := p.l2BlockOrm.UpdateChunkHashInRange(p.ctx, dbChunk.StartBlockNumber, dbChunk.EndBlockNumber, dbChunk.Hash, dbTX); err != nil {
+				log.Error("failed to update chunk_hash for l2_block", "chunk hash", dbChunk.Hash, "start block", dbChunk.StartBlockNumber, "end block", dbChunk.EndBlockNumber, "err", err)
+				return err
+			}
 		}
 		return nil
 	})
@@ -235,17 +224,16 @@ func (p *ChunkProposer) updateDBChunkInfo(chunk *encoding.Chunk, codecVersion en
 	return nil
 }
 
-func (p *ChunkProposer) proposeChunk() error {
+func (p *ChunkProposer) ProposeChunk() error {
 	// unchunkedBlockHeight >= 1, assuming genesis batch with chunk 0, block 0 is committed.
 	unchunkedBlockHeight, err := p.chunkOrm.GetUnchunkedBlockHeight(p.ctx)
 	if err != nil {
 		return err
 	}
 
-	maxBlocksThisChunk := p.maxBlockNumPerChunk
-
-	// select at most maxBlocksThisChunk blocks
-	blocks, err := p.l2BlockOrm.GetL2BlocksGEHeight(p.ctx, unchunkedBlockHeight, int(maxBlocksThisChunk))
+	// select blocks without a hard limit on count in practice (use a large value)
+	// The actual limits will be enforced by gas, timeout, and blob size constraints
+	blocks, err := p.l2BlockOrm.GetL2BlocksGEHeight(p.ctx, unchunkedBlockHeight, 1000)
 	if err != nil {
 		return err
 	}
@@ -256,91 +244,101 @@ func (p *ChunkProposer) proposeChunk() error {
 
 	// Ensure all blocks in the same chunk use the same hardfork name
 	// If a different hardfork name is found, truncate the blocks slice at that point
-	hardforkName := forks.GetHardforkName(p.chainCfg, blocks[0].Header.Number.Uint64(), blocks[0].Header.Time)
+	hardforkName := encoding.GetHardforkName(p.chainCfg, blocks[0].Header.Number.Uint64(), blocks[0].Header.Time)
+	hardforkBoundary := false
 	for i := 1; i < len(blocks); i++ {
-		currentHardfork := forks.GetHardforkName(p.chainCfg, blocks[i].Header.Number.Uint64(), blocks[i].Header.Time)
+		currentHardfork := encoding.GetHardforkName(p.chainCfg, blocks[i].Header.Number.Uint64(), blocks[i].Header.Time)
 		if currentHardfork != hardforkName {
+			// Truncate blocks at hardfork boundary
 			blocks = blocks[:i]
-			maxBlocksThisChunk = uint64(i) // update maxBlocksThisChunk to trigger chunking, because these blocks are the last blocks before the hardfork
+			hardforkBoundary = true
 			break
 		}
 	}
 
-	codecConfig := utils.CodecConfig{
-		Version:        forks.GetCodecVersion(p.chainCfg, blocks[0].Header.Number.Uint64(), blocks[0].Header.Time),
-		EnableCompress: true, // codecv4 is the only version that supports conditional compression, default to enable compression
-	}
+	codecVersion := encoding.GetCodecVersion(p.chainCfg, blocks[0].Header.Number.Uint64(), blocks[0].Header.Time)
 
-	// Including Curie block in a sole chunk.
-	if p.chainCfg.CurieBlock != nil && blocks[0].Header.Number.Cmp(p.chainCfg.CurieBlock) == 0 {
-		chunk := encoding.Chunk{Blocks: blocks[:1]}
-		metrics, calcErr := utils.CalculateChunkMetrics(&chunk, codecConfig)
-		if calcErr != nil {
-			return fmt.Errorf("failed to calculate chunk metrics: %w", calcErr)
-		}
-		p.recordTimerChunkMetrics(metrics)
-		return p.updateDBChunkInfo(&chunk, codecConfig.Version, metrics)
+	if codecVersion < p.minCodecVersion {
+		return fmt.Errorf("unsupported codec version: %v, expected at least %v", codecVersion, p.minCodecVersion)
 	}
 
 	var chunk encoding.Chunk
+	parentChunk, err := p.chunkOrm.GetLatestChunk(p.ctx)
+	if err != nil || parentChunk == nil {
+		return fmt.Errorf("failed to get parent chunk: %w", err)
+	}
+
+	// Currently rollup-relayer only supports >= v7 codec version, it checks the minimum codec version after start.
+	// In EuclidV2 transition, empty PostL1MessageQueueHash will be naturally initialized to the first chunk's PrevL1MessageQueueHash.
+	chunk.PrevL1MessageQueueHash = common.HexToHash(parentChunk.PostL1MessageQueueHash)
+	chunk.PostL1MessageQueueHash = chunk.PrevL1MessageQueueHash
+
+	var previousPostL1MessageQueueHash common.Hash
+	chunk.Blocks = make([]*encoding.Block, 0, len(blocks))
 	for i, block := range blocks {
 		chunk.Blocks = append(chunk.Blocks, block)
 
-		metrics, calcErr := utils.CalculateChunkMetrics(&chunk, codecConfig)
+		previousPostL1MessageQueueHash = chunk.PostL1MessageQueueHash
+		chunk.PostL1MessageQueueHash, err = encoding.MessageQueueV2ApplyL1MessagesFromBlocks(previousPostL1MessageQueueHash, []*encoding.Block{block})
+		if err != nil {
+			return fmt.Errorf("failed to calculate last L1 message queue hash for block %d: %w", block.Header.Number.Uint64(), err)
+		}
+
+		metrics, calcErr := utils.CalculateChunkMetrics(&chunk, codecVersion)
 		if calcErr != nil {
 			return fmt.Errorf("failed to calculate chunk metrics: %w", calcErr)
 		}
 
 		p.recordTimerChunkMetrics(metrics)
 
-		overEstimatedL1CommitGas := uint64(p.gasCostIncreaseMultiplier * float64(metrics.L1CommitGas))
-		if metrics.TxNum > p.maxTxNumPerChunk ||
-			metrics.L1CommitCalldataSize > p.maxL1CommitCalldataSizePerChunk ||
-			overEstimatedL1CommitGas > p.maxL1CommitGasPerChunk ||
-			metrics.CrcMax > p.maxRowConsumptionPerChunk ||
-			metrics.L1CommitBlobSize > maxBlobSize ||
-			metrics.L1CommitUncompressedBatchBytesSize > p.maxUncompressedBatchBytesSize {
+		if metrics.L2Gas > p.cfg.MaxL2GasPerChunk || metrics.L1CommitBlobSize > maxBlobSize || metrics.L1CommitUncompressedBatchBytesSize > p.cfg.MaxUncompressedBatchBytesSize {
 			if i == 0 {
 				// The first block exceeds hard limits, which indicates a bug in the sequencer, manual fix is needed.
-				return fmt.Errorf("the first block exceeds limits; block number: %v, limits: %+v, maxTxNum: %v, maxL1CommitCalldataSize: %v, maxL1CommitGas: %v, maxRowConsumption: %v, maxBlobSize: %v, maxUncompressedBatchBytesSize: %v",
-					block.Header.Number, metrics, p.maxTxNumPerChunk, p.maxL1CommitCalldataSizePerChunk, p.maxL1CommitGasPerChunk, p.maxRowConsumptionPerChunk, maxBlobSize, p.maxUncompressedBatchBytesSize)
+				return fmt.Errorf("the first block exceeds limits; block number: %v, limits: %+v, maxBlobSize: %v, maxUncompressedBatchBytesSize: %v", block.Header.Number, metrics, maxBlobSize, p.cfg.MaxUncompressedBatchBytesSize)
 			}
 
 			log.Debug("breaking limit condition in chunking",
-				"txNum", metrics.TxNum,
-				"maxTxNum", p.maxTxNumPerChunk,
-				"l1CommitCalldataSize", metrics.L1CommitCalldataSize,
-				"maxL1CommitCalldataSize", p.maxL1CommitCalldataSizePerChunk,
-				"l1CommitGas", metrics.L1CommitGas,
-				"overEstimatedL1CommitGas", overEstimatedL1CommitGas,
-				"maxL1CommitGas", p.maxL1CommitGasPerChunk,
-				"rowConsumption", metrics.CrcMax,
-				"maxRowConsumption", p.maxRowConsumptionPerChunk,
+				"l2Gas", metrics.L2Gas,
+				"maxL2Gas", p.cfg.MaxL2GasPerChunk,
 				"l1CommitBlobSize", metrics.L1CommitBlobSize,
 				"maxBlobSize", maxBlobSize,
 				"L1CommitUncompressedBatchBytesSize", metrics.L1CommitUncompressedBatchBytesSize,
-				"maxUncompressedBatchBytesSize", p.maxUncompressedBatchBytesSize)
+				"maxUncompressedBatchBytesSize", p.cfg.MaxUncompressedBatchBytesSize)
 
 			chunk.Blocks = chunk.Blocks[:len(chunk.Blocks)-1]
+			chunk.PostL1MessageQueueHash = previousPostL1MessageQueueHash
 
-			metrics, calcErr := utils.CalculateChunkMetrics(&chunk, codecConfig)
+			metrics, calcErr := utils.CalculateChunkMetrics(&chunk, codecVersion)
 			if calcErr != nil {
 				return fmt.Errorf("failed to calculate chunk metrics: %w", calcErr)
 			}
 
 			p.recordAllChunkMetrics(metrics)
-			return p.updateDBChunkInfo(&chunk, codecConfig.Version, metrics)
+			return p.updateDBChunkInfo(&chunk, codecVersion, metrics)
 		}
 	}
 
-	metrics, calcErr := utils.CalculateChunkMetrics(&chunk, codecConfig)
+	metrics, calcErr := utils.CalculateChunkMetrics(&chunk, codecVersion)
 	if calcErr != nil {
 		return fmt.Errorf("failed to calculate chunk metrics: %w", calcErr)
 	}
 
+	// No breaking condition met, but hardfork boundary reached
+	if hardforkBoundary {
+		log.Info("hardfork boundary reached, proposing chunk",
+			"block count", len(chunk.Blocks),
+			"codec version", codecVersion,
+			"start block number", chunk.Blocks[0].Header.Number,
+			"end block number", chunk.Blocks[len(chunk.Blocks)-1].Header.Number)
+
+		p.recordAllChunkMetrics(metrics)
+		return p.updateDBChunkInfo(&chunk, codecVersion, metrics)
+	}
+
+	// No breaking condition met, check for timeout
 	currentTimeSec := uint64(time.Now().Unix())
-	if metrics.FirstBlockTimestamp+p.chunkTimeoutSec < currentTimeSec || metrics.NumBlocks == maxBlocksThisChunk {
-		log.Info("reached maximum number of blocks in chunk or first block timeout",
+	if metrics.FirstBlockTimestamp+p.cfg.ChunkTimeoutSec < currentTimeSec {
+		log.Info("first block timeout reached",
 			"block count", len(chunk.Blocks),
 			"start block number", chunk.Blocks[0].Header.Number,
 			"start block timestamp", metrics.FirstBlockTimestamp,
@@ -348,7 +346,7 @@ func (p *ChunkProposer) proposeChunk() error {
 
 		p.chunkFirstBlockTimeoutReached.Inc()
 		p.recordAllChunkMetrics(metrics)
-		return p.updateDBChunkInfo(&chunk, codecConfig.Version, metrics)
+		return p.updateDBChunkInfo(&chunk, codecVersion, metrics)
 	}
 
 	log.Debug("pending blocks do not reach one of the constraints or contain a timeout block")
@@ -359,18 +357,12 @@ func (p *ChunkProposer) proposeChunk() error {
 
 func (p *ChunkProposer) recordAllChunkMetrics(metrics *utils.ChunkMetrics) {
 	p.chunkTxNum.Set(float64(metrics.TxNum))
-	p.maxTxConsumption.Set(float64(metrics.CrcMax))
 	p.chunkBlocksNum.Set(float64(metrics.NumBlocks))
-	p.totalL1CommitCalldataSize.Set(float64(metrics.L1CommitCalldataSize))
-	p.chunkEstimateL1CommitGas.Set(float64(metrics.L1CommitGas))
+	p.chunkL2Gas.Set(float64(metrics.L2Gas))
 	p.totalL1CommitBlobSize.Set(float64(metrics.L1CommitBlobSize))
-	p.chunkEstimateGasTime.Set(float64(metrics.EstimateGasTime))
-	p.chunkEstimateCalldataSizeTime.Set(float64(metrics.EstimateCalldataSizeTime))
 	p.chunkEstimateBlobSizeTime.Set(float64(metrics.EstimateBlobSizeTime))
 }
 
 func (p *ChunkProposer) recordTimerChunkMetrics(metrics *utils.ChunkMetrics) {
-	p.chunkEstimateGasTime.Set(float64(metrics.EstimateGasTime))
-	p.chunkEstimateCalldataSizeTime.Set(float64(metrics.EstimateCalldataSizeTime))
 	p.chunkEstimateBlobSizeTime.Set(float64(metrics.EstimateBlobSizeTime))
 }

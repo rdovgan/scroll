@@ -9,18 +9,22 @@ on:
         type: choice
         options:
           - "1.20"
+          - "1.20.14"
           - "1.21"
+          - "1.21.13"
           - "1.22"
+          - "1.22.12"
           - "1.23"
+          - "1.23.7"
         default: "1.21"
       RUST_VERSION:
         description: "Rust toolchain version"
         required: true
         type: choice
         options:
-          - nightly-2023-12-03
-          - nightly-2022-12-10
-        default: "nightly-2023-12-03"
+          - 1.86.0
+          - nightly-2025-08-18
+        default: "nightly-2025-08-18"
       PYTHON_VERSION:
         description: "Python version"
         required: false
@@ -35,7 +39,8 @@ on:
         options:
           - "11.7.1"
           - "12.2.2"
-        default: "11.7.1"
+          - "12.9.1"
+        default: "12.9.1"
       CARGO_CHEF_TAG:
         description: "Cargo chef version"
         required: true
@@ -43,6 +48,7 @@ on:
         type: choice
         options:
           - 0.1.41
+          - 0.1.71
       BASE_IMAGE:
         description: "which intermediate image you want to update"
         required: true
@@ -63,7 +69,8 @@ defaults:
 
 jobs:
   build-and-publish-intermediate:
-    runs-on: ubuntu-latest
+    runs-on:
+        group: scroll-reth-runner-group
     steps:
       - name: Checkout code
         uses: actions/checkout@v4

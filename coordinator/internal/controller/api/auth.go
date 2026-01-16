@@ -46,7 +46,7 @@ func (a *AuthController) Login(c *gin.Context) (interface{}, error) {
 
 	hardForkNames, err := a.loginLogic.ProverHardForkName(&login)
 	if err != nil {
-		return "", fmt.Errorf("prover hard name failure:%w", err)
+		return "", fmt.Errorf("prover hard fork name failure:%w", err)
 	}
 
 	// check the challenge is used, if used, return failure
@@ -70,10 +70,11 @@ func (a *AuthController) PayloadFunc(data interface{}) jwt.MapClaims {
 	}
 
 	return jwt.MapClaims{
-		types.HardForkName:  v.HardForkName,
-		types.PublicKey:     v.PublicKey,
-		types.ProverName:    v.Message.ProverName,
-		types.ProverVersion: v.Message.ProverVersion,
+		types.HardForkName:          v.HardForkName,
+		types.PublicKey:             v.PublicKey,
+		types.ProverName:            v.Message.ProverName,
+		types.ProverVersion:         v.Message.ProverVersion,
+		types.ProverProviderTypeKey: v.Message.ProverProviderType,
 	}
 }
 
@@ -94,6 +95,10 @@ func (a *AuthController) IdentityHandler(c *gin.Context) interface{} {
 
 	if hardForkName, ok := claims[types.HardForkName]; ok {
 		c.Set(types.HardForkName, hardForkName)
+	}
+
+	if providerType, ok := claims[types.ProverProviderTypeKey]; ok {
+		c.Set(types.ProverProviderTypeKey, providerType)
 	}
 
 	return nil

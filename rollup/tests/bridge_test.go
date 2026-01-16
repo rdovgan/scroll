@@ -11,12 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"scroll-tech/database/migrate"
-
-	"scroll-tech/common/database"
-	tc "scroll-tech/common/testcontainers"
-	"scroll-tech/common/utils"
-
 	"github.com/gin-gonic/gin"
 	"github.com/scroll-tech/go-ethereum/accounts/abi/bind"
 	"github.com/scroll-tech/go-ethereum/common"
@@ -25,8 +19,15 @@ import (
 	"github.com/scroll-tech/go-ethereum/crypto"
 	"github.com/scroll-tech/go-ethereum/ethclient"
 	"github.com/scroll-tech/go-ethereum/log"
+	"github.com/scroll-tech/go-ethereum/rpc"
 	"github.com/stretchr/testify/assert"
 	"gorm.io/gorm"
+
+	"scroll-tech/database/migrate"
+
+	"scroll-tech/common/database"
+	tc "scroll-tech/common/testcontainers"
+	"scroll-tech/common/utils"
 
 	bcmd "scroll-tech/rollup/cmd"
 	"scroll-tech/rollup/mock_bridge"
@@ -37,8 +38,9 @@ var (
 	rollupApp *bcmd.MockApp
 
 	// clients
-	l1Client *ethclient.Client
-	l2Client *ethclient.Client
+	l1RawClient *rpc.Client
+	l1Client    *ethclient.Client
+	l2Client    *ethclient.Client
 
 	l1Auth *bind.TransactOpts
 	l2Auth *bind.TransactOpts
@@ -91,8 +93,9 @@ func setupEnv(t *testing.T) {
 	assert.NoError(t, testApps.StartPoSL1Container())
 	rollupApp = bcmd.NewRollupApp(testApps, "../conf/config.json")
 
-	l1Client, err = testApps.GetPoSL1Client()
+	l1RawClient, err = testApps.GetPoSL1Client()
 	assert.NoError(t, err)
+	l1Client = ethclient.NewClient(l1RawClient)
 	l2Client, err = testApps.GetL2GethClient()
 	assert.NoError(t, err)
 	l1GethChainID, err = l1Client.ChainID(context.Background())
@@ -105,12 +108,12 @@ func setupEnv(t *testing.T) {
 	l2Cfg.Confirmations = 0
 	l2Cfg.RelayerConfig.SenderConfig.Confirmations = 0
 
-	pKey, err := crypto.ToECDSA(common.FromHex(l2Cfg.RelayerConfig.CommitSenderPrivateKey))
+	pKey, err := crypto.ToECDSA(common.FromHex(l2Cfg.RelayerConfig.CommitSenderSignerConfig.PrivateKeySignerConfig.PrivateKey))
 	assert.NoError(t, err)
 	l1Auth, err = bind.NewKeyedTransactorWithChainID(pKey, l1GethChainID)
 	assert.NoError(t, err)
 
-	pKey, err = crypto.ToECDSA(common.FromHex(l2Cfg.RelayerConfig.GasOracleSenderPrivateKey))
+	pKey, err = crypto.ToECDSA(common.FromHex(l2Cfg.RelayerConfig.GasOracleSenderSignerConfig.PrivateKeySignerConfig.PrivateKey))
 	assert.NoError(t, err)
 	l2Auth, err = bind.NewKeyedTransactorWithChainID(pKey, l2GethChainID)
 	assert.NoError(t, err)
@@ -208,12 +211,9 @@ func TestFunction(t *testing.T) {
 
 	// l1 rollup and watch rollup events
 	t.Run("TestCommitAndFinalizeGenesisBatch", testCommitAndFinalizeGenesisBatch)
-	t.Run("testCommitBatchAndFinalizeBatchOrBundleWithAllCodecVersions", testCommitBatchAndFinalizeBatchOrBundleWithAllCodecVersions)
-	t.Run("TestCommitBatchAndFinalizeBatchOrBundleCrossingAllTransitions", testCommitBatchAndFinalizeBatchOrBundleCrossingAllTransitions)
+	t.Run("TestCommitBatchAndFinalizeBundleCodecV7", testCommitBatchAndFinalizeBundleCodecV7)
 
-	// l1/l2 gas oracle
+	// l1 gas oracle
 	t.Run("TestImportL1GasPrice", testImportL1GasPrice)
-	t.Run("TestImportL1GasPriceAfterCurie", testImportL1GasPriceAfterCurie)
 	t.Run("TestImportDefaultL1GasPriceDueToL1GasPriceSpike", testImportDefaultL1GasPriceDueToL1GasPriceSpike)
-	t.Run("TestImportL2GasPrice", testImportL2GasPrice)
 }

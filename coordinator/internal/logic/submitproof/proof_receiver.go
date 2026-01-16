@@ -10,15 +10,17 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/scroll-tech/da-codec/encoding"
 	"github.com/scroll-tech/go-ethereum/log"
 	"github.com/scroll-tech/go-ethereum/params"
 	"gorm.io/gorm"
 
-	"scroll-tech/common/forks"
 	"scroll-tech/common/types"
 	"scroll-tech/common/types/message"
 
 	"scroll-tech/coordinator/internal/config"
+	"scroll-tech/coordinator/internal/logic/libzkp"
+	"scroll-tech/coordinator/internal/logic/provertask"
 	"scroll-tech/coordinator/internal/logic/verifier"
 	"scroll-tech/coordinator/internal/orm"
 	coordinatorType "scroll-tech/coordinator/internal/types"
@@ -69,10 +71,18 @@ type ProofReceiverLogic struct {
 	validateFailureProverTaskStatusNotOk  prometheus.Counter
 	validateFailureProverTaskTimeout      prometheus.Counter
 	validateFailureProverTaskHaveVerifier prometheus.Counter
+	proverSpeed                           *prometheus.GaugeVec
+	provingTime                           prometheus.Gauge
+	evmCyclePerGas                        prometheus.Gauge
+
+	ChunkTask  provertask.ProverTask
+	BundleTask provertask.ProverTask
+	BatchTask  provertask.ProverTask
 }
 
 // NewSubmitProofReceiverLogic create a proof receiver logic
 func NewSubmitProofReceiverLogic(cfg *config.ProverManager, chainCfg *params.ChainConfig, db *gorm.DB, vf *verifier.Verifier, reg prometheus.Registerer) *ProofReceiverLogic {
+
 	return &ProofReceiverLogic{
 		chunkOrm:      orm.NewChunk(db),
 		batchOrm:      orm.NewBatch(db),
@@ -127,13 +137,25 @@ func NewSubmitProofReceiverLogic(cfg *config.ProverManager, chainCfg *params.Cha
 			Name: "coordinator_validate_failure_submit_have_been_verifier",
 			Help: "Total number of submit proof validate failure proof have been verifier.",
 		}),
+		evmCyclePerGas: promauto.With(reg).NewGauge(prometheus.GaugeOpts{
+			Name: "evm_circuit_cycle_per_gas",
+			Help: "VM cycles cost for a gas unit cost in evm execution",
+		}),
+		provingTime: promauto.With(reg).NewGauge(prometheus.GaugeOpts{
+			Name: "chunk_proving_time",
+			Help: "Wall clock time for chunk proving in second",
+		}),
+		proverSpeed: promauto.With(reg).NewGaugeVec(prometheus.GaugeOpts{
+			Name: "prover_speed",
+			Help: "Cycle against running time of prover (in mhz)",
+		}, []string{"type", "phase"}),
 	}
 }
 
 // HandleZkProof handle a ZkProof submitted from a prover.
 // For now only proving/verifying error will lead to setting status as skipped.
 // db/unmarshal errors will not because they are errors on the business logic side.
-func (m *ProofReceiverLogic) HandleZkProof(ctx *gin.Context, proofParameter coordinatorType.SubmitProofParameter) error {
+func (m *ProofReceiverLogic) HandleZkProof(ctx *gin.Context, proofParameter coordinatorType.SubmitProofParameter) (rerr error) {
 	m.proofReceivedTotal.Inc()
 	pk := ctx.GetString(coordinatorType.PublicKey)
 	if len(pk) == 0 {
@@ -149,6 +171,18 @@ func (m *ProofReceiverLogic) HandleZkProof(ctx *gin.Context, proofParameter coor
 		log.Error("get none prover task for the proof", "uuid", proofParameter.UUID, "key", pk, "taskID", proofParameter.TaskID, "error", err)
 		return ErrValidatorFailureProverTaskEmpty
 	}
+
+	defer func() {
+		if rerr != nil && types.ProverProveStatus(proverTask.ProvingStatus) == types.ProverAssigned {
+			// trigger a last-chance closing of current task if some routine had missed it
+			log.Warn("last chance proof recover triggerred",
+				"proofID", proofParameter.TaskID,
+				"err", rerr,
+			)
+			m.proofRecover(ctx.Copy(), proverTask, types.ProverTaskFailureTypeUndefined, proofParameter)
+		}
+
+	}()
 
 	proofTime := time.Since(proverTask.CreatedAt)
 	proofTimeSec := uint64(proofTime.Seconds())
@@ -168,26 +202,70 @@ func (m *ProofReceiverLogic) HandleZkProof(ctx *gin.Context, proofParameter coor
 	if getHardForkErr != nil {
 		return ErrGetHardForkNameFailed
 	}
+	if proofParameter.Universal {
+		if len(proverTask.Metadata) == 0 {
+			return errors.New("can not re-wrapping proof: no metadata has been recorded in advance")
+		}
+		var expected_vk []byte
+		switch message.ProofType(proofParameter.TaskType) {
+		case message.ProofTypeChunk:
+			expected_vk = m.verifier.ChunkVk[hardForkName]
+		case message.ProofTypeBatch:
+			expected_vk = m.verifier.BatchVk[hardForkName]
+		case message.ProofTypeBundle:
+			expected_vk = m.verifier.BundleVk[hardForkName]
+		}
+		if len(expected_vk) == 0 {
+			return errors.New("no vk specified match current hard fork, check your config")
+		}
+
+		proofParameter.Proof = libzkp.GenerateWrappedProof(proofParameter.Proof, string(proverTask.Metadata), expected_vk)
+		if proofParameter.Proof == "" {
+			return errors.New("can not re-wrapping proof, see coordinator log for reason")
+		}
+	}
 
 	switch message.ProofType(proofParameter.TaskType) {
 	case message.ProofTypeChunk:
-		var chunkProof message.ChunkProof
+		chunkProof := &message.OpenVMChunkProof{}
 		if unmarshalErr := json.Unmarshal([]byte(proofParameter.Proof), &chunkProof); unmarshalErr != nil {
 			return unmarshalErr
 		}
-		success, verifyErr = m.verifier.VerifyChunkProof(&chunkProof, hardForkName)
+		success, verifyErr = m.verifier.VerifyChunkProof(chunkProof, hardForkName)
+		if stat := chunkProof.VmProof.Stat; stat != nil {
+			if g, _ := m.proverSpeed.GetMetricWithLabelValues("chunk", "exec"); g != nil && stat.ExecutionTimeMills > 0 {
+				g.Set(float64(stat.TotalCycle) / float64(stat.ExecutionTimeMills*1000))
+			}
+			if g, _ := m.proverSpeed.GetMetricWithLabelValues("chunk", "proving"); g != nil && stat.ProvingTimeMills > 0 {
+				g.Set(float64(stat.TotalCycle) / float64(stat.ProvingTimeMills*1000))
+			}
+			if chunkProof.MetaData.TotalGasUsed > 0 {
+				cycle_per_gas := float64(stat.TotalCycle) / float64(chunkProof.MetaData.TotalGasUsed)
+				m.evmCyclePerGas.Set(cycle_per_gas)
+			}
+			m.provingTime.Set(float64(stat.ProvingTimeMills) / 1000)
+		}
+
 	case message.ProofTypeBatch:
-		var batchProof message.BatchProof
+		batchProof := &message.OpenVMBatchProof{}
 		if unmarshalErr := json.Unmarshal([]byte(proofParameter.Proof), &batchProof); unmarshalErr != nil {
 			return unmarshalErr
 		}
-		success, verifyErr = m.verifier.VerifyBatchProof(&batchProof, hardForkName)
+		success, verifyErr = m.verifier.VerifyBatchProof(batchProof, hardForkName)
+		if stat := batchProof.VmProof.Stat; stat != nil {
+			if g, _ := m.proverSpeed.GetMetricWithLabelValues("batch", "exec"); g != nil && stat.ExecutionTimeMills > 0 {
+				g.Set(float64(stat.TotalCycle) / float64(stat.ExecutionTimeMills*1000))
+			}
+			if g, _ := m.proverSpeed.GetMetricWithLabelValues("batch", "proving"); g != nil && stat.ProvingTimeMills > 0 {
+				g.Set(float64(stat.TotalCycle) / float64(stat.ProvingTimeMills*1000))
+			}
+		}
 	case message.ProofTypeBundle:
-		var bundleProof message.BundleProof
+		bundleProof := &message.OpenVMBundleProof{}
 		if unmarshalErr := json.Unmarshal([]byte(proofParameter.Proof), &bundleProof); unmarshalErr != nil {
 			return unmarshalErr
 		}
-		success, verifyErr = m.verifier.VerifyBundleProof(&bundleProof, hardForkName)
+		success, verifyErr = m.verifier.VerifyBundleProof(bundleProof, hardForkName)
 	}
 
 	if verifyErr != nil || !success {
@@ -245,6 +323,20 @@ func (m *ProofReceiverLogic) validator(ctx context.Context, proverTask *orm.Prov
 		}
 	}()
 
+	// Internally we overide the timeout failure:
+	// if prover task FailureType is SessionInfoFailureTimeout, the submit proof is timeout, but we still accept it
+	if types.ProverProveStatus(proverTask.ProvingStatus) == types.ProverProofInvalid &&
+		types.ProverTaskFailureType(proverTask.FailureType) == types.ProverTaskFailureTypeTimeout {
+		m.validateFailureProverTaskTimeout.Inc()
+		proverTask.ProvingStatus = int16(types.ProverAssigned)
+
+		proofTime := time.Since(proverTask.CreatedAt)
+		proofTimeSec := uint64(proofTime.Seconds())
+		log.Warn("proof submit proof have timeout", "hash", proofParameter.TaskID, "taskType", proverTask.TaskType,
+			"proverName", proverTask.ProverName, "proverPublicKey", pk, "proofTime", proofTimeSec)
+
+	}
+
 	// Ensure this prover is eligible to participate in the prover task.
 	if types.ProverProveStatus(proverTask.ProvingStatus) == types.ProverProofValid ||
 		types.ProverProveStatus(proverTask.ProvingStatus) == types.ProverProofInvalid {
@@ -262,10 +354,7 @@ func (m *ProofReceiverLogic) validator(ctx context.Context, proverTask *orm.Prov
 		return ErrValidatorFailureProverTaskCannotSubmitTwice
 	}
 
-	proofTime := time.Since(proverTask.CreatedAt)
-	proofTimeSec := uint64(proofTime.Seconds())
-
-	if proofParameter.Status != int(message.StatusOk) {
+	if proofParameter.Status != int(coordinatorType.StatusOk) {
 		// Temporarily replace "panic" with "pa-nic" to prevent triggering the alert based on logs.
 		failureMsg := strings.Replace(proofParameter.FailureMsg, "panic", "pa-nic", -1)
 
@@ -278,14 +367,6 @@ func (m *ProofReceiverLogic) validator(ctx context.Context, proverTask *orm.Prov
 			"proverVersion", proverTask.ProverVersion, "proverPublicKey", pk, "failureType", proofParameter.FailureType,
 			"failureMessage", failureMsg)
 		return ErrValidatorFailureProofMsgStatusNotOk
-	}
-
-	// if prover task FailureType is SessionInfoFailureTimeout, the submit proof is timeout, need skip it
-	if types.ProverTaskFailureType(proverTask.FailureType) == types.ProverTaskFailureTypeTimeout {
-		m.validateFailureProverTaskTimeout.Inc()
-		log.Info("proof submit proof have timeout, skip this submit proof", "hash", proofParameter.TaskID, "taskType", proverTask.TaskType,
-			"proverName", proverTask.ProverName, "proverPublicKey", pk, "proofTime", proofTimeSec)
-		return ErrValidatorFailureProofTimeout
 	}
 
 	// store the proof to prover task
@@ -302,6 +383,7 @@ func (m *ProofReceiverLogic) validator(ctx context.Context, proverTask *orm.Prov
 			"taskType", proverTask.TaskType, "proverName", proverTask.ProverName, "proverPublicKey", pk)
 		return ErrValidatorFailureTaskHaveVerifiedSuccess
 	}
+
 	return nil
 }
 
@@ -318,7 +400,7 @@ func (m *ProofReceiverLogic) closeProofTask(ctx context.Context, proverTask *orm
 	log.Info("proof close task update proof status", "hash", proverTask.TaskID, "proverPublicKey", proverTask.ProverPublicKey,
 		"taskType", message.ProofType(proverTask.TaskType).String(), "status", types.ProvingTaskVerified.String())
 
-	if err := m.updateProofStatus(ctx, proverTask, proofParameter, types.ProverProofValid, types.ProverTaskFailureTypeUndefined, proofTimeSec); err != nil {
+	if err := m.updateProofStatus(ctx, proverTask, proofParameter, types.ProverProofValid, types.ProverTaskFailureType(proverTask.FailureType), proofTimeSec); err != nil {
 		log.Error("failed to updated proof status ProvingTaskVerified", "hash", proverTask.TaskID, "proverPublicKey", proverTask.ProverPublicKey, "error", err)
 		return err
 	}
@@ -379,6 +461,9 @@ func (m *ProofReceiverLogic) updateProofStatus(ctx context.Context, proverTask *
 	if err != nil {
 		return err
 	}
+	// sync status and failture type into proverTask
+	proverTask.ProvingStatus = int16(status)
+	proverTask.FailureType = int16(failureType)
 
 	if status == types.ProverProofValid && message.ProofType(proofParameter.TaskType) == message.ProofTypeChunk {
 		if checkReadyErr := m.checkAreAllChunkProofsReady(ctx, proverTask.TaskID); checkReadyErr != nil {
@@ -462,6 +547,6 @@ func (m *ProofReceiverLogic) hardForkName(ctx *gin.Context, hash string, proofTy
 		return "", getBlockErr
 	}
 
-	hardForkName := forks.GetHardforkName(m.chainCfg, l2Block.Number, l2Block.BlockTimestamp)
+	hardForkName := encoding.GetHardforkName(m.chainCfg, l2Block.Number, l2Block.BlockTimestamp)
 	return hardForkName, nil
 }

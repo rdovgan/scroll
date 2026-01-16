@@ -29,62 +29,54 @@ func TestFFI(t *testing.T) {
 	as := assert.New(t)
 
 	cfg := &config.VerifierConfig{
-		MockMode: false,
-		LowVersionCircuit: &config.CircuitConfig{
-			ParamsPath:       *paramsPath,
-			AssetsPath:       *assetsPathLo,
-			ForkName:         "darwin",
-			MinProverVersion: "",
-		},
-		HighVersionCircuit: &config.CircuitConfig{
-			ParamsPath:       *paramsPath,
-			AssetsPath:       *assetsPathHi,
-			ForkName:         "darwinV2",
-			MinProverVersion: "",
-		},
+		MinProverVersion: "",
+		Verifiers: []config.AssetConfig{{
+			AssetsPath: *assetsPathHi,
+			ForkName:   "euclidV2",
+		}},
 	}
 
 	v, err := NewVerifier(cfg)
 	as.NoError(err)
 
 	chunkProof1 := readChunkProof(*chunkProofPath1, as)
-	chunkOk1, err := v.VerifyChunkProof(chunkProof1, "darwinV2")
+	chunkOk1, err := v.VerifyChunkProof(chunkProof1, "euclidV2")
 	as.NoError(err)
 	as.True(chunkOk1)
 	t.Log("Verified chunk proof 1")
 
 	chunkProof2 := readChunkProof(*chunkProofPath2, as)
-	chunkOk2, err := v.VerifyChunkProof(chunkProof2, "darwinV2")
+	chunkOk2, err := v.VerifyChunkProof(chunkProof2, "euclidV2")
 	as.NoError(err)
 	as.True(chunkOk2)
 	t.Log("Verified chunk proof 2")
 
 	batchProof := readBatchProof(*batchProofPath, as)
-	batchOk, err := v.VerifyBatchProof(batchProof, "darwinV2")
+	batchOk, err := v.VerifyBatchProof(batchProof, "euclidV2")
 	as.NoError(err)
 	as.True(batchOk)
 	t.Log("Verified batch proof")
 }
 
-func readBatchProof(filePat string, as *assert.Assertions) *message.BatchProof {
+func readBatchProof(filePat string, as *assert.Assertions) *message.OpenVMBatchProof {
 	f, err := os.Open(filePat)
 	as.NoError(err)
 	byt, err := io.ReadAll(f)
 	as.NoError(err)
 
-	proof := &message.BatchProof{}
+	proof := &message.OpenVMBatchProof{}
 	as.NoError(json.Unmarshal(byt, proof))
 
 	return proof
 }
 
-func readChunkProof(filePat string, as *assert.Assertions) *message.ChunkProof {
+func readChunkProof(filePat string, as *assert.Assertions) *message.OpenVMChunkProof {
 	f, err := os.Open(filePat)
 	as.NoError(err)
 	byt, err := io.ReadAll(f)
 	as.NoError(err)
 
-	proof := &message.ChunkProof{}
+	proof := &message.OpenVMChunkProof{}
 	as.NoError(json.Unmarshal(byt, proof))
 
 	return proof
